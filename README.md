@@ -1,17 +1,58 @@
-# Web Network Mapper
+<p align="center">
+  <a href="https://github.com/invertilo">
+    <img src="https://github.com/invertilo.png" width="128" alt="Vinicius" />
+  </a>
+</p>
 
-Web Network Mapper mapea un sitio leyendo el mismo tráfico que muestra la pestaña **Network** de DevTools. Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP).
+<h3 align="center">Vinicius</h3>
 
-Con esa captura arma cuatro resultados:
+<p align="center">
+  <a href="https://github.com/invertilo"><strong>@invertilo</strong></a>
+  · Santa Cruz de la Sierra
+</p>
 
-- el **mapa de páginas**
-- el **mapa de APIs**
-- el **flujo completo**, de la carga inicial a la respuesta con los datos
-- un **curl listo** para cada paso
+<p align="center">
+  <a href="https://github.com/invertilo/Scrapping-Web">
+    <img src="https://img.shields.io/badge/python-3-3776AB?logo=python&logoColor=white" alt="Python 3" />
+  </a>
+  <a href="https://github.com/invertilo/Scrapping-Web">
+    <img src="https://img.shields.io/badge/Playwright-Chromium-2EAD33?logo=playwright&logoColor=white" alt="Playwright" />
+  </a>
+</p>
+
+---
+
+<h1 align="center">Web Network Mapper</h1>
+
+<p align="center">
+  Mapea un sitio leyendo el mismo tráfico que muestra la pestaña <strong>Network</strong> de DevTools.
+</p>
+
+Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP). Con esa captura arma cuatro resultados:
+
+| Resultado | Dónde queda |
+|---|---|
+| Mapa de páginas | `pages.json` |
+| Mapa de APIs | `api_map.md` |
+| Flujo de inicio a fin | `flow.md` y `flow.sh` |
+| Un curl por paso | dentro del flujo y en `curls.sh` |
 
 Después puede volver a llamar esas APIs con paginación y exportar los datos a JSON o CSV. También hace reconocimiento pasivo de un dominio: subdominios, detección de Cloudflare y posibles IPs de origen.
 
-Está hecha en Python. El código vive en `/home/box/tools/web-network-mapper/`.
+## Contenido
+
+- [Piezas](#piezas)
+- [Instalación](#instalación)
+- [Capturar y mapear](#capturar-y-mapear)
+- [Flujo de inicio a fin](#flujo-de-inicio-a-fin)
+- [Mapa de APIs](#mapa-de-apis)
+- [Extraer datos](#extraer-datos)
+- [Recon pasivo](#recon-pasivo)
+- [Archivos de cada corrida](#archivos-de-cada-corrida)
+- [Curl y secretos](#curl-y-secretos)
+- [Captcha](#captcha)
+- [Seguridad](#seguridad)
+- [Límites](#límites)
 
 ## Piezas
 
@@ -28,33 +69,32 @@ Los comandos de uso son `wnm-map`, `wnm-analyze`, `wnm-replay`, `wnm-recon` y `w
 
 ## Instalación
 
-Una sola vez:
-
 ```bash
-T=/home/box/tools/web-network-mapper
-$T/setup.sh
+git clone https://github.com/invertilo/Scrapping-Web.git
+cd Scrapping-Web
+./setup.sh
 ```
 
-`setup.sh` crea el entorno virtual e instala Playwright y Chromium.
+`setup.sh` crea el entorno virtual e instala Playwright y Chromium. En los ejemplos de abajo, `T` es la carpeta del clon.
 
 ## Capturar y mapear
 
 ```bash
-T=/home/box/tools/web-network-mapper
+T="$PWD"
 RUN=$($T/wnm-map https://ejemplo.com/ --depth 1 --max-pages 20 | tail -1)
 echo "$RUN"
 ```
 
 `$RUN` es la carpeta con todos los resultados de esa corrida.
 
-Flags útiles:
-
-- `--scroll` — scroll infinito y carga perezosa.
-- `--actions archivo.json` — clics y escritura que disparan requests (ver `examples/`).
-- `--headed` — muestra el navegador para llenar un formulario o un captcha a mano.
-- `--emit-curl api` — vuelca las requests como curl en `curls.sh`.
-- `--include REGEX` — se queda solo con las URLs que coinciden.
-- `--block image,font` — descarta tipos de recurso que no aportan al mapa.
+| Flag | Para qué |
+|---|---|
+| `--scroll` | Scroll infinito y carga perezosa. |
+| `--actions archivo.json` | Clics y escritura que disparan requests. Ver `examples/`. |
+| `--headed` | Muestra el navegador para llenar un formulario o un captcha a mano. |
+| `--emit-curl api` | Vuelca las requests como curl en `curls.sh`. |
+| `--include REGEX` | Se queda solo con las URLs que coinciden. |
+| `--block image,font` | Descarta tipos de recurso que no aportan al mapa. |
 
 Para un sitio con login, primero guarda la sesión:
 
@@ -62,13 +102,11 @@ Para un sitio con login, primero guarda la sesión:
 $T/wnm-login https://ejemplo.com/login
 ```
 
-El navegador se abre y la persona completa el acceso. La sesión queda guardada y se reutiliza con `--storage-state` o `--cookies`.
+El navegador se abre y completas el acceso. La sesión queda guardada y se reutiliza con `--storage-state` o `--cookies`.
 
 ## Flujo de inicio a fin
 
 El archivo central es `$RUN/flow.md`: la secuencia ordenada de todas las requests, desde que se abre la página hasta la respuesta con los datos, con el curl de cada paso. Los pasos que necesitan a una persona (captcha, desafío) van marcados con 🧑.
-
-Para recorrer esa cadena en una sola sesión:
 
 ```bash
 bash $RUN/flow.sh
@@ -86,8 +124,6 @@ $T/wnm-analyze $RUN
 
 `$RUN/api_map.md` lista cada endpoint con sus marcas (`DATA`, `RECORDS`, `PAGINATED`, `GRAPHQL`), los parámetros, la ruta de los registros y un bloque curl listo para pegar. Arriba incluye un resumen del flujo completo.
 
-Para volcar todas las requests como curl:
-
 ```bash
 $T/wnm-analyze $RUN --emit-curl
 ```
@@ -103,12 +139,13 @@ $T/wnm-replay $RUN/api_map.json 1 --paginate page --max-pages 0 --format both
 
 La salida queda en `$RUN/extracts/` (JSON y CSV). `--curl` y `--dry-run` muestran la request exacta sin enviarla.
 
-Otras formas de paginar:
-
-- cursor: `--cursor-param` y `--cursor-path`
-- enlace a la página siguiente: `--next-url-path`
-- valores explícitos: `--values a,b,c`
-- un parámetro concreto: `--param K=V`
+| Paginación | Flags |
+|---|---|
+| Por número de página | `--paginate page` |
+| Por cursor | `--cursor-param` y `--cursor-path` |
+| Por enlace a la siguiente | `--next-url-path` |
+| Por valores explícitos | `--values a,b,c` |
+| Un parámetro concreto | `--param K=V` |
 
 ## Recon pasivo
 
@@ -138,17 +175,17 @@ Cada curl lleva método, URL con la query de ejemplo, cabeceras capturadas y cue
 
 Por defecto, cookies, tokens y campos sensibles salen como `${VARIABLES}`, con una nota de qué exportar antes de ejecutar. `--keep-secrets` en la captura guarda los valores reales. `wnm-analyze --curl-secrets` los escribe en el curl si se guardaron. `--curl-redact` fuerza los placeholders.
 
-Los cuerpos de respuesta no se redactan.
+Los cuerpos de respuesta se guardan tal cual.
 
 ## Captcha
 
-El captcha existe para impedir la automatización desatendida. La herramienta detecta ese paso, muestra la imagen y espera a que una persona escriba el texto. Con esa respuesta completa el resto del flujo. Cada consulta nueva necesita una sesión fresca y un captcha nuevo.
+La herramienta detecta el paso del captcha, muestra la imagen y espera a que escribas el texto. Con esa respuesta completa el resto del flujo. Cada consulta nueva necesita una sesión fresca y un captcha nuevo.
 
 ## Seguridad
 
-- Los dominios `.gob`, `.gov` y `.mil` (y variantes como `gob.bo` o `gov.co`) se rechazan solos. Con autorización explícita para ese sitio, el comando se antepone con `WNM_ALLOW_RESTRICTED=1`.
-- Respeta esperas y `robots.txt`. Los límites solo se suben en sitios propios o autorizados.
-- Los secretos se ocultan en logs, HAR y curl. Los tokens y las cookies no se pegan en el chat.
+- Los dominios `.gob`, `.gov` y `.mil` (y variantes como `gob.bo` o `gov.co`) se rechazan solos. Con autorización explícita para ese sitio, antepón `WNM_ALLOW_RESTRICTED=1`.
+- Respeta esperas y `robots.txt`. Los límites se suben en sitios propios o autorizados.
+- Los secretos se ocultan en logs, HAR y curl.
 - Los desafíos de captcha, Cloudflare y los muros de pago quedan como pasos humanos.
 
 ## Límites
