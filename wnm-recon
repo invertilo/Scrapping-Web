@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Wrapper: runs recon.py with the tool's venv (run setup.sh first for the browser fallback).
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -x "$HERE/.venv/bin/python" ]; then
+  exec "$HERE/.venv/bin/python" "$HERE/recon.py" "$@"
+else
+  # venv missing: fall back to system python3 (crt.sh+DNS still work; c99 browser fallback won't)
+  echo "note: venv missing, using system python3 (run setup.sh to enable the browser fallback)" >&2
+  exec python3 "$HERE/recon.py" "$@"
+fi

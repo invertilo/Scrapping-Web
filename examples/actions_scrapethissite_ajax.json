@@ -1,0 +1,6 @@
+[
+  {"action": "click", "selector": "a.year-link[id='2015']", "after_ms": 800},
+  {"action": "wait_for_selector", "selector": "tr.film", "timeout": 15000},
+  {"action": "click", "selector": "a.year-link[id='2014']", "after_ms": 800},
+  {"action": "click", "selector": "a.year-link[id='2013']", "after_ms": 800, "optional": true}
+]
