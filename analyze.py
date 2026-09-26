@@ -2,6 +2,8 @@
 """Build api_map.json / api_map.md (and enrich pages.json) from a mapper run directory.
 
 Usage: analyze.py RUN_DIR [--map-documents] [--emit-curl [all|api|nonstatic]] [--curl-secrets | --curl-redact]
+       [--no-json-schema] [--no-postman] [--no-html] [--no-replay-script]
+       [--proto FILE|DIR] [--descriptor FDS] [--proto-message TYPE]
 Runs automatically at the end of mapper.py; re-run it by hand after tweaking heuristics.
 """
 from __future__ import annotations
@@ -17,7 +19,7 @@ from urllib.parse import parse_qsl, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wnm_common import (  # noqa: E402
     REDACTED, is_sensitive_field, is_sensitive_header, loads_lenient,
-    decode_body_bytes, detect_body_kind, detect_anti_bot, get_path,
+    decode_body_bytes, detect_body_kind, detect_anti_bot, get_path, slugify,
 )
 from wnm_curl import build_curl, env_comment  # noqa: E402
 
@@ -425,9 +427,18 @@ def emit_curls(run_dir: Path, recs, redact: bool, scope: str = "all") -> tuple[P
 
 
 def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_secrets: bool = False,
-          curl_redact: bool = False, write_openapi: bool = True) -> dict:
+          curl_redact: bool = False, write_openapi: bool = True, write_json_schema: bool = True,
+          write_postman: bool = True, write_html: bool = True, write_replay: bool = True,
+          proto: str | None = None, descriptor: str | None = None, proto_message: str | None = None) -> dict:
     run_dir = Path(run_dir)
     recs = read_jsonl(run_dir / "requests.jsonl")
+    # entradas WS/SSE (kind: websocket|sse) de otros capturadores: fuera del pipeline HTTP, solo para su sección
+    recs_all = recs
+    try:
+        # solo se excluyen frames/eventos (sin status HTTP); la request HTTP de un EventSource se mantiene
+        recs = [r for r in recs if isinstance(r, dict) and not (_is_stream_entry(r) and r.get("status") is None)]
+    except Exception:
+        recs = recs_all
     pages_path = run_dir / "pages.json"
     pages = json.loads(pages_path.read_text()) if pages_path.exists() else []
     meta = json.loads((run_dir / "run_meta.json").read_text()) if (run_dir / "run_meta.json").exists() else {}
@@ -658,6 +669,10 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
         except Exception:
             final["role"] = "OTHER"
         final["pagination_confirmed"] = bool(pag_confirmed)
+        try:
+            final["data_param"] = detect_data_param(dict(final, pagination_params=pag_params))
+        except Exception:
+            final["data_param"] = None
         final["confirmed_paginator"] = confirmed_param
         if pag_confirmed and not pag_suggest and confirmed_param:
             leaf = confirmed_param.split(":")[-1].split(".")[-1]
@@ -689,6 +704,10 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
     out_eps.sort(key=score, reverse=True)
     for i, e in enumerate(out_eps, 1):
         e["index"] = i
+    try:
+        _decode_protobuf_endpoints(run_dir, out_eps, proto, descriptor, None, proto_message)
+    except Exception:
+        pass
 
     # websockets
     ws = OrderedDict()
@@ -739,6 +758,28 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
         "endpoints_with_rate_limit": len(rl_eps), "status_429_total": sum((e["rate_limit"] or {}).get("status_429", 0) for e in rl_eps),
         "notes": [{"endpoint": e["key"], "note": e.get("rate_limit_note")} for e in rl_eps[:20]]}
     api_map["endpoint_roles"] = dict(Counter(e.get("role") or "OTHER" for e in out_eps if not e["likely_tracking"]))
+    try:
+        api_map["ws_sse"] = load_ws_sse(run_dir, recs_all)
+    except Exception as e:
+        api_map["ws_sse"] = []
+        api_map["ws_sse_error"] = str(e)[:200]
+    if proto or descriptor:
+        try:
+            dec_info = get_proto_decoder(proto, descriptor)
+            api_map["protobuf_decoder"] = {"enabled": dec_info.enabled, "error": dec_info.error,
+                                           "types": dec_info.type_names[:50], "proto": proto, "descriptor": descriptor}
+        except Exception as e:
+            api_map["protobuf_decoder"] = {"enabled": False, "error": str(e)[:200]}
+    api_map["protobuf_decoded_endpoints"] = sum(1 for e in out_eps if e.get("protobuf_decoded"))
+    if write_json_schema:
+        try:
+            js = build_json_schemas(run_dir, out_eps, start_url)
+            if js:
+                api_map["json_schema_file"] = js["file"]
+                api_map["json_schema_dir"] = js["dir"]
+                api_map["json_schema_count"] = js["count"]
+        except Exception as e:
+            api_map["json_schema_error"] = str(e)[:200]
     if write_openapi:
         try:
             if [e for e in out_eps if not e["likely_tracking"] and not e["third_party"]]:
@@ -748,6 +789,25 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
                 api_map["openapi_paths"] = len(oa.get("paths") or {})
         except Exception as e:
             api_map["openapi_error"] = str(e)[:200]
+    if write_postman:
+        try:
+            if [e for e in out_eps if not e["likely_tracking"] and not e["third_party"]]:
+                pm = build_postman(api_map, redact=curl_red)
+                (run_dir / "postman_collection.json").write_text(json.dumps(pm, indent=2, ensure_ascii=False, default=list))
+                api_map["postman_file"] = str((run_dir / "postman_collection.json").resolve())
+                api_map["postman_requests"] = sum(len(f["item"]) for f in pm["item"])
+        except Exception as e:
+            api_map["postman_error"] = str(e)[:200]
+    if write_replay:
+        try:
+            (run_dir / "replay.sh").write_text(build_replay_script(run_dir, out_eps, start_url))
+            try:
+                (run_dir / "replay.sh").chmod(0o755)
+            except OSError:
+                pass
+            api_map["replay_script"] = str((run_dir / "replay.sh").resolve())
+        except Exception as e:
+            api_map["replay_script_error"] = str(e)[:200]
     flow = build_flow(run_dir, recs, curl_red, start_host)
     try:
         annotate_flow_tokens(run_dir, flow, recs)
@@ -768,6 +828,13 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
         api_map["curls_count"] = n
     elif (run_dir / "curls.sh").exists():
         api_map["curls_file"] = str((run_dir / "curls.sh").resolve())
+    if write_html:
+        try:
+            api_map["html_file"] = str((run_dir / "report.html").resolve())
+            (run_dir / "report.html").write_text(render_html(api_map, pages, failed, run_dir), encoding="utf-8")
+        except Exception as e:
+            api_map.pop("html_file", None)
+            api_map["html_error"] = str(e)[:200]
     (run_dir / "api_map.json").write_text(json.dumps(api_map, indent=2, ensure_ascii=False, default=list))
 
     # enrich pages.json
@@ -787,6 +854,15 @@ def build(run_dir, include_documents=False, emit_curl: str | None = None, curl_s
             "anti_bot": [a["vendor"] for a in api_map.get("anti_bot") or []],
             "rate_limited_endpoints": api_map["rate_limit_summary"]["endpoints_with_rate_limit"],
             "roles": api_map.get("endpoint_roles"),
+            "json_schema": api_map.get("json_schema_file"),
+            "json_schema_count": api_map.get("json_schema_count", 0),
+            "postman_file": api_map.get("postman_file"),
+            "html_file": api_map.get("html_file"),
+            "replay_script": api_map.get("replay_script"),
+            "data_params": {e["key"]: f"{e['data_param']['in']}:{e['data_param']['name']}"
+                            for e in out_eps if e.get("data_param") and not e["likely_tracking"]},
+            "protobuf_decoded_endpoints": api_map.get("protobuf_decoded_endpoints", 0),
+            "ws_sse_streams": len(api_map.get("ws_sse") or []),
             "api_map_json": str((run_dir / "api_map.json").resolve()),
             "api_map_md": str((run_dir / "api_map.md").resolve())}
 
@@ -1918,9 +1994,13 @@ def _render_endpoint_extras(e) -> list[str]:
         L.append(f"- Rate limit: {e['rate_limit_note']}")
     if any(f in e.get("flags", []) for f in ("GRPC", "PROTOBUF")):
         bb = e.get("binary_body") or {}
-        L.append(f"- Cuerpo binario {'gRPC-web' if 'GRPC' in e['flags'] else 'protobuf'} (no decodificado): "
+        _pdq = e.get("protobuf_decoded") or {}
+        _st = ("decodificado con esquema, ver abajo" if _pdq.get("schema_based") else
+               "solo decodificación genérica sin esquema, ver abajo" if _pdq else "no decodificado")
+        L.append(f"- Cuerpo binario {'gRPC-web' if 'GRPC' in e['flags'] else 'protobuf'} ({_st}): "
                  f"content-type {', '.join(bb.get('content_types') or []) or '-'}; tamaños {bb.get('sizes') or '-'} bytes. "
-                 "Para decodificar hace falta el .proto (o `protoc --decode_raw`).")
+                 + ("Para decodificar con nombres de campo reales pasa `--proto <archivo|dir>` o `--descriptor <fds>`."
+                    if not _pdq.get("schema_based") else ""))
     pq = e.get("persisted_query")
     if pq:
         L.append(f"- GraphQL persisted query: operationName `{pq.get('operationName') or '-'}`, sha256Hash "
@@ -1993,6 +2073,112 @@ def _render_extra_sections(m) -> list[str]:
     return L
 
 
+def _render_md_new_files(m) -> list[str]:
+    """Líneas de cabecera de api_map.md para los archivos nuevos (JSON Schema, Postman, HTML, replay.sh)."""
+    L = []
+    if m.get("json_schema_file"):
+        L.append(f"- JSON Schema (draft 2020-12): `{m['json_schema_file']}` (consolidado) + "
+                 f"`{m.get('json_schema_dir')}/` ({m.get('json_schema_count', 0)} endpoint(s))")
+    elif m.get("json_schema_error"):
+        L.append(f"- JSON Schema: no se pudo generar ({m['json_schema_error']})")
+    if m.get("postman_file"):
+        L.append(f"- Colección Postman v2.1.0: `{m['postman_file']}` ({m.get('postman_requests', 0)} request(s); "
+                 "variables `{{host}}` y `{{token}}`)")
+    elif m.get("postman_error"):
+        L.append(f"- Postman: no se pudo generar ({m['postman_error']})")
+    if m.get("replay_script"):
+        L.append(f"- Script de extracción con paginación: `{m['replay_script']}` (un `wnm-replay` por endpoint de datos)")
+    if m.get("html_file"):
+        L.append(f"- Reporte HTML navegable (offline): `{m['html_file']}`")
+    pd = m.get("protobuf_decoder")
+    if pd:
+        L.append(f"- Decodificador protobuf: {'activo, tipos: ' + ', '.join(pd.get('types') or []) if pd.get('enabled') else 'NO disponible (' + str(pd.get('error')) + ')'}"
+                 + (f" — aviso: {pd['error']}" if pd.get("enabled") and pd.get("error") else ""))
+    return L
+
+
+def _render_endpoint_new(e, rd=None) -> list[str]:
+    L = []
+    dp = e.get("data_param")
+    if dp:
+        ex = f" (ej. `{dp['example']}`)" if dp.get("example") not in (None, "") else ""
+        L.append(f"- Dato de entrada (data_param): **{dp['in']} `{dp['name']}`**{ex} — {dp.get('note')}. "
+                 "Es el valor a variar para extracción masiva.")
+        cmd = _data_param_replay_cmd(e, rd)
+        if cmd:
+            L.append(f"- Extracción sugerida: `{cmd}`")
+    if e.get("json_schema_file"):
+        L.append(f"- JSON Schema: `{e['json_schema_file']}`")
+    return L
+
+
+def _data_param_replay_cmd(e, rd=None) -> str | None:
+    dp = e.get("data_param") or {}
+    if not dp:
+        return None
+    base = f"{TOOL_DIR}/wnm-replay {(str(rd) + '/') if rd else ''}api_map.json {e['index']}"
+    var = "$" + _data_var_name(dp.get("name") or "DATO")
+    if dp.get("in") == "query":
+        base += f" --param {shlex_quote(dp['name'])}=\"{var}\""
+    elif dp.get("in") == "body" and (e.get("request_body") or {}).get("kind") == "json":
+        base += f" --body-set {shlex_quote(dp['name'])}=\"{var}\""
+    elif dp.get("in") == "path":
+        ex_url = (e.get("replay") or {}).get("url") or (e.get("example_urls") or [None])[0]
+        ex = dp.get("example")
+        if ex_url and ex and str(ex) in urlsplit(ex_url).path:
+            u, _env = _replay_url_with_vars(ex_url)
+            base += " --url " + _dq(u.replace(str(ex), "${" + var[1:] + "}", 1))
+        else:
+            base += f" --url <URL con {var} en la ruta>"
+    else:
+        base += f" --data <cuerpo con {dp['name']}={var}> (comando completo en replay.sh)"
+    if e.get("suggested_replay_args"):
+        base += " " + e["suggested_replay_args"]
+    return base + " --max-pages 5"
+
+
+def _render_protobuf_md(e) -> list[str]:
+    pdq = e.get("protobuf_decoded")
+    if not pdq:
+        return []
+    L = []
+    if pdq.get("schema_based"):
+        L.append("\n<details><summary>Cuerpo protobuf/gRPC decodificado con el esquema (.proto / descriptor)</summary>\n")
+    else:
+        L.append("\n<details><summary>Protobuf: decodificación genérica sin esquema (número de campo + wire type + valor crudo)</summary>\n")
+        L.append("> Decodificación genérica sin esquema: los nombres de campo son desconocidos; aporta `--proto` o "
+                 "`--descriptor` para obtener JSON con nombres reales.\n")
+    for fr in (pdq.get("frames") or [])[:3]:
+        hdr = f"{fr.get('body_file')} ({fr.get('bytes')} bytes)"
+        if fr.get("schema"):
+            hdr += f" → mensaje `{fr.get('message_type')}`"
+            if fr.get("unknown_fields"):
+                hdr += f" ({fr['unknown_fields']} campo(s) desconocido(s))"
+        L.append(f"- {hdr}")
+        L.append("```json")
+        body = fr.get("json") if fr.get("schema") else fr.get("generic")
+        L.append(json.dumps(body, indent=2, ensure_ascii=False, default=str)[:3000])
+        L.append("```")
+    L.append("</details>")
+    return L
+
+
+def _render_ws_sse_md(m) -> list[str]:
+    wss = m.get("ws_sse") or []
+    if not wss:
+        return []
+    L = ["## WebSocket / SSE (capturas adicionales)\n"]
+    for w in wss:
+        L.append(f"- {(w.get('kind') or 'stream').upper()} `{w.get('url')}` enviados={w.get('frames_sent', 0)} "
+                 f"recibidos={w.get('frames_received', 0)} mensajes={w.get('messages', 0)}"
+                 + (f" estado={w['state']}" if w.get("state") else "")
+                 + (f" (página {w['page']})" if w.get("page") else ""))
+        for smp in (w.get("samples") or [])[:3]:
+            L.append(f"  - {smp.get('dir')}: `{str(smp.get('payload'))[:150]}`")
+    L.append("")
+    return L
+
+
 def render_md(m, pages, failed, run_dir: Path) -> str:
     L = []
     rd = m["run_dir"]
@@ -2013,6 +2199,10 @@ def render_md(m, pages, failed, run_dir: Path) -> str:
             L.append(f"- OpenAPI: no se pudo generar ({m['openapi_error']})")
         else:
             L.append("- OpenAPI: no generado (sin endpoints de API propios: sitio renderizado en servidor o --no-openapi)")
+        try:
+            L.extend(_render_md_new_files(m))
+        except Exception:
+            pass
         if m.get("endpoint_roles"):
             L.append(f"- Roles de endpoints: {_fmt_counter(m['endpoint_roles'])}")
         rls = m.get("rate_limit_summary") or {}
@@ -2060,6 +2250,10 @@ def render_md(m, pages, failed, run_dir: Path) -> str:
         L.append(f"- Flags: **{' '.join(e['flags']) or 'none'}**")
         try:
             L.extend(_render_endpoint_extras(e))
+        except Exception:
+            pass
+        try:
+            L.extend(_render_endpoint_new(e, rd))
         except Exception:
             pass
         L.append(f"- Example: {e['example_urls'][0] if e['example_urls'] else '-'}")
@@ -2112,6 +2306,10 @@ def render_md(m, pages, failed, run_dir: Path) -> str:
             L.append("```")
             L.extend(schema_outline(e["response_schema"], max_lines=35))
             L.append("```\n</details>")
+        try:
+            L.extend(_render_protobuf_md(e))
+        except Exception:
+            pass
         L.append("")
     if track:
         L.append("## Tracking / analytics endpoints (ignored)\n")
@@ -2125,6 +2323,10 @@ def render_md(m, pages, failed, run_dir: Path) -> str:
             for s in w["samples"]:
                 L.append(f"  - {s['dir']}: `{s['payload'][:150]}`")
         L.append("")
+    try:
+        L.extend(_render_ws_sse_md(m))
+    except Exception:
+        pass
     if m.get("page_templates"):
         L.append("## Page templates (HTML URL patterns)\n")
         for g in m["page_templates"][:25]:
@@ -2162,6 +2364,1237 @@ def render_md(m, pages, failed, run_dir: Path) -> str:
     return "\n".join(L)
 
 
+# ================================================================== ADDITIVE FEATURES (improvements)
+# Todo lo de abajo es aditivo y defensivo: no reescribe el comportamiento existente.
+
+# ------------------------------------------------------------------ 1) JSON Schema (draft 2020-12)
+
+def _js_types(s):
+    t = s.get("type")
+    types = t if isinstance(t, list) else [t]
+    return [x for x in types if x]
+
+
+def infer_to_jsonschema(s, depth=0):
+    """Convierte un esquema inferido (formato infer/merge) a JSON Schema draft 2020-12."""
+    if not isinstance(s, dict) or depth > 15:
+        return {}
+    types = _js_types(s)
+    out: dict = {}
+    if len(types) == 1:
+        out["type"] = types[0]
+    elif types:
+        out["type"] = types
+    non_null = [x for x in types if x != "null"]
+    tt = non_null[0] if non_null else None
+    if tt == "object":
+        if s.get("properties"):
+            out["properties"] = {str(k): infer_to_jsonschema(v, depth + 1) for k, v in s["properties"].items()}
+        if s.get("additionalProperties"):
+            out["additionalProperties"] = infer_to_jsonschema(s["additionalProperties"], depth + 1)
+    elif tt == "array":
+        out["items"] = infer_to_jsonschema(s["items"], depth + 1) if s.get("items") else {}
+    if "example" in s and s["example"] != REDACTED and tt not in ("object", "array") \
+            and not (isinstance(s["example"], str) and len(s["example"]) == 80 and s["example"].endswith("...")):
+        out["examples"] = [s["example"]]
+        if tt == "string":
+            fmt = _string_format(s["example"])
+            if fmt:
+                out["format"] = fmt
+    return out
+
+
+_FMT_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _string_format(v) -> str | None:
+    if not isinstance(v, str) or v.endswith("..."):
+        return None
+    if _FMT_DT_RE.match(v):
+        return "date-time"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        return "date"
+    if UUID_RE.match(v):
+        return "uuid"
+    if re.fullmatch(r"https?://\S+", v):
+        return "uri"
+    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", v):
+        return "email"
+    return None
+
+
+def _load_sample_jsons(run_dir: Path, e) -> list:
+    out = []
+    for bf in (e.get("sample_bodies") or [])[:5]:
+        try:
+            raw = (Path(run_dir) / bf).read_bytes()
+            try:
+                raw = decode_body_bytes(raw, None)
+            except Exception:
+                pass
+            txt = raw.decode("utf-8", errors="replace")
+            if txt.lstrip()[:1] not in "[{)fw":
+                continue
+            out.append(loads_lenient(txt))
+        except Exception:
+            continue
+    return out
+
+
+def _annotate_required(js, values, depth=0):
+    """Marca `required` con las claves presentes en TODAS las muestras observadas (objetos) y recurre en
+    propiedades / items. Con una sola muestra no se infiere `required` (sería engañoso)."""
+    if not isinstance(js, dict) or depth > 12 or not values:
+        return
+    objs = [v for v in values if isinstance(v, dict)]
+    if objs and js.get("properties"):
+        if len(objs) >= 2:
+            req = [k for k in js["properties"] if all(k in o for o in objs)]
+            if req:
+                js["required"] = req
+        for k, sub in js["properties"].items():
+            _annotate_required(sub, [o[k] for o in objs if k in o][:200], depth + 1)
+    arrs = [v for v in values if isinstance(v, list)]
+    if arrs and isinstance(js.get("items"), dict):
+        items = [x for a in arrs for x in a[:50]][:300]
+        _annotate_required(js["items"], items, depth + 1)
+
+
+def build_json_schemas(run_dir: Path, eps, start_url) -> dict | None:
+    """Escribe schemas/<endpoint>.schema.json por endpoint de datos con respuesta JSON y un
+    schemas.json consolidado. Devuelve metadatos ({dir, file, count, per_endpoint}) o None."""
+    data_eps = [e for e in eps if e.get("response_schema") and not e.get("likely_tracking")
+                and (e.get("likely_data_endpoint") or e.get("role") in ("SEARCH", "LIST", "DETAIL"))]
+    if not data_eps:
+        return None
+    schemas_dir = run_dir / "schemas"
+    schemas_dir.mkdir(exist_ok=True)
+    consolidated = OrderedDict([
+        ("$schema", "https://json-schema.org/draft/2020-12/schema"),
+        ("title", f"Esquemas de respuesta inferidos: {start_url}"),
+        ("description", "Generado por web-network-mapper (analyze.py). Best-effort: tipos inferidos de las "
+                        "respuestas JSON observadas (varias muestras determinan nullabilidad y arrays anidados)."),
+        ("$defs", OrderedDict()),
+    ])
+    per_endpoint = {}
+    used = set()
+    for e in data_eps:
+        slug = slugify(e["key"], 70) or f"endpoint_{e.get('index')}"
+        base, n = slug, 2
+        while slug in used:
+            slug = f"{base}_{n}"
+            n += 1
+        used.add(slug)
+        body = infer_to_jsonschema(e["response_schema"])
+        try:
+            samples = _load_sample_jsons(run_dir, e)
+            if samples:
+                _annotate_required(body, samples)
+                body.setdefault("x-samples", len(samples))
+        except Exception:
+            pass
+        doc = OrderedDict([
+            ("$schema", "https://json-schema.org/draft/2020-12/schema"),
+            ("$id", f"{slug}.schema.json"),
+            ("title", e["key"]),
+            ("description", f"Esquema inferido de la respuesta de `{e['key']}` (rol {e.get('role') or 'OTHER'})."),
+        ])
+        doc.update(body)
+        rec = e.get("response_records") or {}
+        if rec.get("jsonpath"):
+            doc["x-record-array"] = rec["jsonpath"]
+        (schemas_dir / f"{slug}.schema.json").write_text(json.dumps(doc, indent=2, ensure_ascii=False, default=list))
+        consolidated["$defs"][slug] = body
+        per_endpoint[e["key"]] = f"schemas/{slug}.schema.json"
+        e["json_schema_file"] = f"schemas/{slug}.schema.json"
+    try:  # limpiar esquemas propios obsoletos de un análisis anterior (solo *.schema.json generados aquí)
+        keep = {Path(v).name for v in per_endpoint.values()}
+        for old in schemas_dir.glob("*.schema.json"):
+            if old.name not in keep:
+                old.unlink()
+    except Exception:
+        pass
+    cpath = run_dir / "schemas.json"
+    cpath.write_text(json.dumps(consolidated, indent=2, ensure_ascii=False, default=list))
+    return {"dir": str(schemas_dir.resolve()), "file": str(cpath.resolve()),
+            "count": len(per_endpoint), "per_endpoint": per_endpoint}
+
+
+# ------------------------------------------------------------------ 2) data param (dato de entrada)
+
+DATA_PARAM_SKIP_RE = re.compile(r"^(javax\.faces\.|jsf|__|_|g-recaptcha|h-captcha|cf-turnstile)", re.I)
+PLATE_RE = re.compile(r"^[A-Za-z0-9\-]{3,12}$")
+
+
+def _looks_like_data_value(v) -> int:
+    """Puntaje heurístico: ¿parece un dato de entrada (placa, id, término de búsqueda)?"""
+    if v is None:
+        return 0
+    s = str(v).strip()
+    if not s or s == REDACTED:
+        return 0
+    if re.fullmatch(r"true|false|@all|@none", s, re.I):
+        return 0
+    if UUID_RE.match(s):
+        return 5
+    if PLATE_RE.match(s) and re.search(r"[A-Za-z]", s) and re.search(r"\d", s):
+        return 4  # placa / id alfanumérico corto
+    if re.fullmatch(r"\d{1,12}", s):
+        return 2
+    if re.search(r"[A-Za-z]", s) and re.search(r"\d", s) and len(s) <= 24 and " " not in s:
+        return 3
+    if HEX_RE.match(s):
+        return 3
+    if " " in s or (s.replace(" ", "").isalpha() and 2 <= len(s) <= 40):
+        return 2  # término de búsqueda
+    return 1
+
+
+def _schema_scalar_examples(s, pre="", out=None, depth=0):
+    if out is None:
+        out = {}
+    if not isinstance(s, dict) or depth > 6:
+        return out
+    if s.get("properties"):
+        for k, v in s["properties"].items():
+            _schema_scalar_examples(v, f"{pre}.{k}" if pre else str(k), out, depth + 1)
+    elif "example" in s:
+        out[pre or "value"] = s["example"]
+    return out
+
+
+def detect_data_param(e) -> dict | None:
+    """Identifica el parámetro que el usuario variaría para extracción masiva (placa, id, búsqueda).
+    Devuelve {in, name, example, is_search, note} o None."""
+    role = e.get("role")
+    path = e.get("path_template") or ""
+    if role not in ("SEARCH", "DETAIL", "LIST"):
+        return None  # ACTION (login, mutaciones) / OTHER: no es un dato de extracción
+    if role == "DETAIL" and ("{id}" in path or "{date}" in path):
+        ex = (e.get("example_urls") or [None])[0]
+        val = None
+        if ex:
+            tsegs = path.split("/")
+            psegs = urlsplit(ex).path.split("/")
+            for a, b in zip(tsegs, psegs):
+                if a in ("{id}", "{date}"):
+                    val = b
+        segs = [x for x in path.split("/") if x]
+        prev = next((segs[i - 1] for i in range(len(segs) - 1, 0, -1) if segs[i].startswith(("{id}", "{date}"))), "")
+        pname = (re.sub(r"[^A-Za-z0-9]+", "_", prev).strip("_").rstrip("s") + "_id") if prev and not prev.startswith("{") else "id"
+        return {"in": "path", "name": pname, "example": val, "is_search": False,
+                "note": "identificador en la ruta del recurso"}
+    cands = []  # (score, in, name, example, is_search)
+    qp = e.get("query_params") or {}
+    pag = set(e.get("pagination_params") or [])
+    for k, info in qp.items():
+        leaf = k.split(".")[-1]
+        if k in pag or PAGINATION_PARAM_RE.match(leaf) or is_sensitive_field(k):
+            continue
+        vals = info.get("values") or []
+        best = max((_looks_like_data_value(v) for v in vals), default=0)
+        is_search = bool(SEARCH_PARAM_RE.match(leaf))
+        score = best + (4 if is_search else 0) + (2 if info.get("varies") else 0)
+        if score > 0:
+            ex = next((v for v in vals if v not in (REDACTED, "")), None)
+            cands.append((score, "query", k, ex, is_search or bool(info.get("varies"))))
+    rb = e.get("request_body") or {}
+    fields = {}
+    is_gql = bool(e.get("graphql_operations")) or "GRAPHQL" in (e.get("flags") or [])
+    if rb.get("kind") == "form":
+        fields = rb.get("fields") or {}
+    elif rb.get("kind") == "json":
+        fields = _schema_scalar_examples(rb.get("schema"))
+        if is_gql:  # el sobre GraphQL (query/operationName/extensions) no es dato: solo variables.*
+            fields = {k: v for k, v in fields.items() if k.startswith("variables.")}
+    if is_gql:
+        cands = [c for c in cands if c[2] not in ("query", "operationName", "extensions", "variables")]
+    for k, v in (fields.items() if isinstance(fields, dict) else []):
+        leaf = str(k).split(".")[-1]
+        if PAGINATION_PARAM_RE.match(leaf) or DATA_PARAM_SKIP_RE.search(str(k)):
+            continue
+        if is_sensitive_field(leaf) or CAPTCHA_FIELD_RE.search(str(k)):
+            continue
+        if str(v) == str(k) or str(v) in ("", "@all", "@none"):
+            continue  # campos estructurales JSF (nombre==valor)
+        is_search = bool(SEARCH_PARAM_RE.match(leaf))
+        score = _looks_like_data_value(v) + (4 if is_search else 0)
+        if score > 0:
+            cands.append((score, "body", k, (v if v != REDACTED else None), is_search))
+    if role == "LIST":
+        cands = [c for c in cands if c[4] or c[0] >= 5]  # en listados solo si es claramente búsqueda/id variable
+    if not cands:
+        return None
+    cands.sort(key=lambda c: (c[0], c[4]), reverse=True)
+    b = cands[0]
+    is_search = bool(SEARCH_PARAM_RE.match(str(b[2]).split(".")[-1]))
+    varies = b[1] == "query" and bool((qp.get(b[2]) or {}).get("varies"))
+    note = ("término de búsqueda" if is_search else
+            "filtro que varía entre llamadas" if varies and role == "LIST" else "dato de entrada (id/identificador)")
+    return {"in": b[1], "name": b[2], "example": b[3], "is_search": is_search, "note": note}
+
+
+# ------------------------------------------------------------------ 3) replay.sh (extracción cableada)
+
+def _replay_url_with_vars(url: str) -> tuple[str, dict]:
+    """URL con los valores redactados/sensibles de la query como $VARIABLES (misma regla que los curl)."""
+    try:
+        c = build_curl("GET", url, {}, None, redact=True)
+        u = next((a for a in c["args"] if a.startswith(("http://", "https://"))), url)
+        return u, c["env"]
+    except Exception:
+        return url, {}
+
+
+_GENERIC_SEG_RE = re.compile(r"^(j_?idt\d+|j_id\d*|ruat\w*|input(text)?|\w*_input|\w*_focus|value|field|txt|campo|form|frm\w*|pnl\w*|"
+                             r"variables|data|params?|filter|busqueda|datosbusqueda|panel\w*|\d+)$", re.I)
+
+
+def _data_var_name(name: str) -> str:
+    """Nombre corto de variable de shell para el data_param (p.ej. 'a:frm:identificador-placapta:ruatInputText'
+    -> IDENTIFICADOR_PLACAPTA)."""
+    segs = [x for x in re.split(r"[:.\[\]]+", str(name or "")) if x]
+    pick = next((x for x in reversed(segs) if not _GENERIC_SEG_RE.match(x)), segs[-1] if segs else "DATO")
+    v = _shvar(pick)
+    return v[:40] or "DATO"
+
+
+def _dq(s: str) -> str:
+    """Comillas dobles para bash dejando expandir ${VAR} (escapa \\ \" y `)."""
+    return '"' + re.sub(r'([\\"`])', r"\\\1", s) + '"'
+
+
+def build_replay_script(run_dir: Path, eps, start_url) -> str | None:
+    """Genera replay.sh: un comando wnm-replay por endpoint de datos, con la paginación ya cableada
+    (usa suggested_replay_args / confirmed_paginator) y el data_param como variable a completar. No
+    duplica la lógica de paginación de replay.py: la invoca."""
+    from urllib.parse import quote_plus
+    data_eps = [e for e in eps if e.get("likely_data_endpoint") and not e.get("third_party")
+                and not e.get("likely_tracking")]
+    # también endpoints SEARCH/DETAIL propios con dato de entrada aunque no tengan flag DATA (p.ej. JSF)
+    for e in eps:
+        if e not in data_eps and e.get("data_param") and e.get("role") in ("SEARCH", "DETAIL") \
+                and not e.get("third_party") and not e.get("likely_tracking"):
+            data_eps.append(e)
+    map_path = str((run_dir / "api_map.json").resolve())
+    replay = f"{TOOL_DIR}/wnm-replay"
+    L = ["#!/usr/bin/env bash",
+         f"# Script de extracción generado por web-network-mapper para: {start_url}",
+         "# Un comando wnm-replay por endpoint de datos, con la paginación ya cableada.",
+         "# La lógica de paginación NO se duplica aquí: la aporta replay.py (wnm-replay).",
+         "# Uso: completa las variables marcadas (el 'dato de entrada' de cada endpoint) y ejecuta:",
+         "#   ./replay.sh            -> corre todos los endpoints",
+         "#   ./replay.sh 2          -> corre solo el endpoint #2",
+         "# Los resultados se guardan en $OUT_DIR como CSV + JSON (--format both).",
+         "# Si la captura redactó secretos, exporta antes las variables indicadas (AUTHORIZATION, COOKIE, ...).",
+         "set -euo pipefail",
+         f'MAP="${{MAP:-{map_path}}}"',
+         'OUT_DIR="${OUT_DIR:-./extracts}"; mkdir -p "$OUT_DIR"',
+         'MAX_PAGES="${MAX_PAGES:-5}"   # 0 = hasta agotar la paginación (tope duro de replay.py)',
+         'DELAY="${DELAY:-1}"           # segundos entre requests (respeta el rate limit)',
+         'ONLY="${1:-}"                 # número de endpoint a ejecutar (vacío = todos)',
+         ""]
+    if not data_eps:
+        L.append("# (no se detectaron endpoints de datos aptos para extracción automática)")
+        return "\n".join(L) + "\n"
+    used_vars = set()
+    for e in data_eps:
+        idx = e.get("index")
+        rp = e.get("replay") or {}
+        L.append(f"# ---- Endpoint {idx}: {e['key']}  (rol {e.get('role') or 'OTHER'})")
+        dp = e.get("data_param")
+        pag_args = e.get("suggested_replay_args") or ""
+        if e.get("pagination_confirmed"):
+            L.append(f"#   Paginación CONFIRMADA por `{e.get('confirmed_paginator')}`.")
+        elif pag_args:
+            L.append("#   Paginación sugerida por nombre de parámetro (no confirmada con dos llamadas distintas).")
+        else:
+            L.append("#   Sin paginación detectada: una sola request por valor del dato de entrada.")
+        if e.get("rate_limit_note"):
+            L.append(f"#   Rate limit observado: {e['rate_limit_note']} -> sube DELAY si ves 429.")
+        if "PROTOBUF" in (e.get("flags") or []) or "GRPC" in (e.get("flags") or []):
+            L.append("#   AVISO: cuerpo protobuf/gRPC; replay.py espera JSON en la respuesta, puede no extraer registros.")
+        L.append(f'if [ -z "$ONLY" ] || [ "$ONLY" = "{idx}" ]; then')
+        cmd = [replay, '"$MAP"', str(idx)]
+        env = {}
+        if dp:
+            var = _data_var_name(dp.get("name") or "DATO")
+            if var in ("MAP", "OUT_DIR", "MAX_PAGES", "DELAY", "ONLY", "EXTRA"):
+                var = "DATO_" + var
+            if var in used_vars:
+                var = f"{var}_{idx}"  # otro endpoint ya usa ese nombre: evitar que un valor se filtre al siguiente
+            used_vars.add(var)
+            ex = dp.get("example")
+            default = str(ex) if ex not in (None, "", REDACTED) else "CAMBIAME"
+            L.append(f"  # Dato de entrada ({dp.get('note')}): {dp.get('in')} `{dp.get('name')}`. Edita ${var}")
+            L.append(f"  {var}=\"${{{var}:-{re.sub(r'([\\"`$])', r'\\\1', default)}}}\"")
+            if dp["in"] == "query":
+                cmd += ["--param", _dq(f"{dp['name']}=${{{var}}}")]
+            elif dp["in"] == "body" and (e.get("request_body") or {}).get("kind") == "json":
+                cmd += ["--body-set", _dq(f"{dp['name']}=${{{var}}}")]
+            elif dp["in"] == "path":
+                ex_url = rp.get("url") or (e.get("example_urls") or [None])[0]
+                if ex_url and ex and str(ex) in urlsplit(ex_url).path:
+                    u, env_u = _replay_url_with_vars(ex_url)
+                    env.update(env_u)
+                    cmd += ["--url", _dq(u.replace(str(ex), f"${{{var}}}", 1))]
+                else:
+                    L.append(f"  # TODO: agrega --url con ${var} insertado en la ruta")
+            else:  # cuerpo form: se reenvía el POST capturado con el campo sustituido
+                pd = rp.get("post_data") or ""
+                if pd and REDACTED not in pd and "%5BREDACTED%5D" not in pd:
+                    pairs = parse_qsl(pd, keep_blank_values=True)
+                    parts = []
+                    for k, v in pairs:
+                        if k == dp["name"]:
+                            parts.append(f"{quote_plus(k)}=${{{var}}}")
+                        else:
+                            parts.append(f"{quote_plus(k)}={quote_plus(v)}")
+                    cmd += ["--data", _dq("&".join(parts))]
+                    if any(HIDDEN_TOKEN_FIELDS and (k in HIDDEN_TOKEN_FIELDS or CAPTCHA_FIELD_RE.search(k)) for k, _ in pairs):
+                        L.append("  # AVISO: el POST lleva tokens de un solo uso (ViewState/CSRF) y/o captcha: caducan.")
+                        L.append("  #        Sigue el flujo completo (flow.sh) para obtener valores frescos antes de este paso.")
+                else:
+                    L.append(f"  # TODO (cuerpo form redactado): pasa --data con `{dp['name']}=${var}` y el resto de campos.")
+        else:
+            L.append("  # (sin dato de entrada variable detectado: extrae la lista/paginación completa)")
+        # headers que la captura redactó -> se pasan desde variables de entorno si están exportadas
+        red_hdrs = [k for k, v in (rp.get("headers") or {}).items()
+                    if isinstance(v, str) and REDACTED in v and not k.startswith(":")]
+        L.append("  EXTRA=()")
+        for h in red_hdrs:
+            ev = _shvar(h)
+            L.append(f'  [ -n "${{{ev}:-}}" ] && EXTRA+=(--header "{_canon_hdr(h)}: ${{{ev}}}")  # redactado en la captura')
+        for ev, desc in env.items():
+            L.append(f"  : \"${{{ev}:?exporta {ev} ({desc})}}\"")
+        if pag_args:
+            cmd.append(pag_args)
+        cmd += ["--max-pages", '"$MAX_PAGES"', "--delay", '"$DELAY"', "--format", "both",
+                "--out", f'"$OUT_DIR/endpoint_{idx}"', '${EXTRA[@]+"${EXTRA[@]}"}']
+        L.append("  " + " ".join(cmd))
+        L.append("fi")
+        L.append("")
+    L.append('echo "Extracción lista. Revisa $OUT_DIR/" >&2')
+    return "\n".join(L) + "\n"
+
+
+# ------------------------------------------------------------------ 4) protobuf / gRPC decode
+
+def _read_varint(b, i):
+    shift = 0
+    result = 0
+    while i < len(b):
+        byte = b[i]
+        i += 1
+        result |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return result, i
+        shift += 7
+        if shift > 63:
+            return None, i
+    return None, i
+
+
+def _printable_text(chunk: bytes):
+    if len(chunk) < 2:
+        return None
+    try:
+        t = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if any((ord(c) < 32 and c not in "\t\n\r") for c in t):
+        return None
+    letters = sum(c.isalnum() or c.isspace() or c in "-_.:/@" for c in t)
+    if letters / max(1, len(t)) < 0.7:
+        return None
+    return t
+
+
+def _pb_scan(raw: bytes, depth=0):
+    """Escáner genérico de wire-format protobuf. Devuelve (campos, fully_parsed)."""
+    out = []
+    i, n = 0, len(raw)
+    ok = True
+    while i < n:
+        tag, i = _read_varint(raw, i)
+        if tag is None:
+            ok = False
+            break
+        field = tag >> 3
+        wt = tag & 7
+        if field == 0:
+            ok = False
+            break
+        if wt == 0:
+            v, i = _read_varint(raw, i)
+            if v is None:
+                ok = False
+                break
+            out.append({"field": field, "wire_type": 0, "type": "varint", "value": v})
+        elif wt == 1:
+            if i + 8 > n:
+                ok = False
+                break
+            out.append({"field": field, "wire_type": 1, "type": "fixed64", "value_hex": raw[i:i + 8].hex()})
+            i += 8
+        elif wt == 2:
+            ln, i = _read_varint(raw, i)
+            if ln is None or i + ln > n:
+                ok = False
+                break
+            chunk = raw[i:i + ln]
+            i += ln
+            entry = {"field": field, "wire_type": 2, "type": "bytes", "len": ln}
+            txt = _printable_text(chunk)
+            sub, subok = (_pb_scan(chunk, depth + 1) if (depth < 5 and ln > 0) else ([], False))
+            if txt is not None:
+                # texto legible: string (si además parsea como mensaje se deja la alternativa)
+                entry = {"field": field, "wire_type": 2, "type": "string", "value": txt[:300]}
+                if subok and sub and len(sub) > 1:
+                    entry["alt_message"] = sub
+            elif subok and sub:
+                entry = {"field": field, "wire_type": 2, "type": "message", "fields": sub}
+            else:
+                entry["value_hex"] = chunk[:80].hex()
+            out.append(entry)
+        elif wt == 5:
+            if i + 4 > n:
+                ok = False
+                break
+            out.append({"field": field, "wire_type": 5, "type": "fixed32", "value_hex": raw[i:i + 4].hex()})
+            i += 4
+        else:
+            ok = False
+            break
+    return out, (ok and i == n)
+
+
+def protobuf_generic_decode(raw: bytes):
+    """Volcado genérico sin esquema (número de campo + wire type + valor crudo)."""
+    if not raw:
+        return None
+    fields, ok = _pb_scan(raw)
+    if not fields:
+        return None
+    return {"fully_parsed": ok, "fields": fields}
+
+
+def _iter_grpc_web_frames(raw: bytes):
+    """Separa el framing gRPC-web (prefijo de 5 bytes: 1 flag + 4 longitud big-endian). Los frames
+    con el bit 0x80 (trailers) se omiten. Si no hay framing válido, devuelve el cuerpo tal cual."""
+    if len(raw) >= 5:
+        i, n = 0, len(raw)
+        frames = []
+        valid = True
+        while i + 5 <= n:
+            flag = raw[i]
+            ln = int.from_bytes(raw[i + 1:i + 5], "big")
+            if i + 5 + ln > n:
+                valid = False
+                break
+            payload = raw[i + 5:i + 5 + ln]
+            if not (flag & 0x80):  # 0x80 = trailers, no es un mensaje
+                frames.append(payload)
+            i += 5 + ln
+        if valid and i == n and frames:
+            return frames
+    return [raw]
+
+
+class ProtoDecoder:
+    """Decodifica protobuf/gRPC a JSON cuando el usuario aporta un .proto o un FileDescriptorSet."""
+
+    def __init__(self, proto=None, descriptor=None):
+        self.enabled = False
+        self.error = None
+        self.msg_classes = []
+        self.type_names = []
+        try:
+            from google.protobuf import descriptor_pb2, descriptor_pool, message_factory  # noqa: F401
+        except Exception as e:  # protobuf no instalado
+            self.error = f"librería protobuf no disponible: {e}"
+            return
+        fds_bytes = []
+        try:
+            if descriptor:
+                fds_bytes.append(Path(descriptor).read_bytes())
+            if proto:
+                fb = self._compile_proto(proto)
+                if fb:
+                    fds_bytes.append(fb)
+        except SystemExit as e:
+            self.error = str(e)[:200]
+        except Exception as e:
+            self.error = str(e)[:200]
+        if not fds_bytes:
+            if not self.error:
+                self.error = "sin --proto ni --descriptor válidos"
+            return
+        try:
+            from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+            pool = descriptor_pool.DescriptorPool()
+            seen = set()
+            files = []
+            for fb in fds_bytes:
+                fs = descriptor_pb2.FileDescriptorSet()
+                fs.ParseFromString(fb)
+                for f in fs.file:
+                    if f.name in seen:
+                        continue
+                    seen.add(f.name)
+                    files.append(f)
+            for f in files:
+                try:
+                    pool.Add(f)
+                except Exception:
+                    pass
+            for f in files:
+                for mt in f.message_type:
+                    full = (f.package + "." if f.package else "") + mt.name
+                    try:
+                        md = pool.FindMessageTypeByName(full)
+                        self.msg_classes.append((full, message_factory.GetMessageClass(md)))
+                        self.type_names.append(full)
+                    except Exception:
+                        pass
+            self.enabled = bool(self.msg_classes)
+            if not self.enabled and not self.error:
+                self.error = "no se encontraron mensajes en el esquema aportado"
+        except Exception as e:
+            self.error = str(e)[:200]
+
+    def _compile_proto(self, proto):
+        from grpc_tools import protoc
+        import grpc_tools
+        import os as _osx
+        import tempfile
+        p = Path(proto)
+        if p.is_dir():
+            protos = [str(x) for x in p.rglob("*.proto")]
+            includes = {str(p)}
+        elif p.is_file():
+            protos = [str(p)]
+            includes = {str(p.parent)}
+        else:
+            raise SystemExit(f"--proto no existe: {proto}")
+        if not protos:
+            raise SystemExit("no se encontraron archivos .proto")
+        wk = _osx.path.join(_osx.path.dirname(grpc_tools.__file__), "_proto")
+        tf = tempfile.NamedTemporaryFile(suffix=".fds", delete=False)
+        tf.close()
+        args = ["protoc"] + [f"-I{i}" for i in includes] + [f"-I{wk}",
+                "--include_imports", f"--descriptor_set_out={tf.name}"] + protos
+        rc = protoc.main(args)
+        if rc == 0:
+            return Path(tf.name).read_bytes()
+        if len(protos) > 1:
+            # degradar: compilar archivo por archivo y juntar los que compilan
+            from google.protobuf import descriptor_pb2
+            merged = descriptor_pb2.FileDescriptorSet()
+            names, failed = set(), []
+            for one in protos:
+                rc1 = protoc.main(["protoc"] + [f"-I{i}" for i in includes] + [f"-I{wk}", "--include_imports",
+                                  f"--descriptor_set_out={tf.name}", one])
+                if rc1 != 0:
+                    failed.append(Path(one).name)
+                    continue
+                part = descriptor_pb2.FileDescriptorSet()
+                part.ParseFromString(Path(tf.name).read_bytes())
+                for f in part.file:
+                    if f.name not in names:
+                        names.add(f.name)
+                        merged.file.append(f)
+            if merged.file:
+                if failed:
+                    self.error = f"se omitieron .proto que no compilan: {', '.join(failed[:10])}"
+                return merged.SerializeToString()
+        raise SystemExit(f"protoc falló al compilar el .proto (rc={rc})")
+
+    def decode(self, raw: bytes, prefer: str | None = None, direction: str = "response"):
+        """Prueba cada mensaje del esquema; elige el que deja menos campos desconocidos y más campos conocidos."""
+        from google.protobuf import json_format
+        try:
+            from google.protobuf import unknown_fields as _uf
+        except Exception:
+            _uf = None
+        classes = self.msg_classes
+        if prefer:
+            classes = [c for c in classes if c[0] == prefer or c[0].endswith("." + prefer)] or classes
+        best = None
+        for name, Cls in classes:
+            try:
+                m = Cls()
+                m.ParseFromString(raw)
+            except Exception:
+                continue
+            try:
+                d = json_format.MessageToDict(m)
+            except Exception:
+                continue
+            if not d:
+                continue
+            unknown = 0
+            if _uf is not None:
+                try:
+                    unknown = len(_uf.UnknownFieldSet(m))
+                except Exception:
+                    unknown = 0
+            is_req_name = bool(re.search(r"(Request|Req|Params|Query|Input)$", name))
+            dir_ok = is_req_name if direction == "request" else not is_req_name
+            score = (-unknown, len(m.ListFields()), dir_ok, len(json.dumps(d, default=str)))
+            if best is None or score > best[0]:
+                best = (score, name, d, unknown)
+        if best:
+            out = {"message_type": best[1], "json": best[2]}
+            if best[3]:
+                out["unknown_fields"] = best[3]
+            return out
+        return None
+
+
+_PROTO_DECODER_CACHE: dict = {}
+
+
+def get_proto_decoder(proto=None, descriptor=None):
+    """ProtoDecoder cacheado por (proto, descriptor) para no compilar el .proto dos veces."""
+    if not (proto or descriptor):
+        return None
+    k = (str(proto or ""), str(descriptor or ""))
+    if k not in _PROTO_DECODER_CACHE:
+        _PROTO_DECODER_CACHE[k] = ProtoDecoder(proto, descriptor)
+    return _PROTO_DECODER_CACHE[k]
+
+
+def _decode_protobuf_endpoints(run_dir: Path, eps, proto=None, descriptor=None, api_map=None, proto_message=None):
+    """Decodifica bodies protobuf/gRPC-web de los endpoints marcados. Con --proto/--descriptor intenta
+    mapear el mensaje real; si no, hace un volcado genérico sin esquema. Degrada limpio."""
+    targets = [e for e in eps if (e.get("body_kind") in ("grpc", "protobuf"))
+               or any(f in (e.get("flags") or []) for f in ("GRPC", "PROTOBUF"))]
+    if not targets:
+        return
+    dec = None
+    if proto or descriptor:
+        dec = get_proto_decoder(proto, descriptor)
+        if api_map is not None:
+            api_map["protobuf_decoder"] = {"enabled": dec.enabled, "error": dec.error, "types": dec.type_names[:50]}
+    for e in targets:
+        results = []
+        for bf in (e.get("sample_bodies") or [])[:3]:
+            try:
+                raw = (Path(run_dir) / bf).read_bytes()
+            except Exception:
+                continue
+            for frame in _iter_grpc_web_frames(raw):
+                item = {"body_file": bf, "bytes": len(frame)}
+                done = False
+                if dec and dec.enabled:
+                    try:
+                        d = dec.decode(frame, proto_message)
+                    except Exception:
+                        d = None
+                    if d:
+                        item["schema"] = True
+                        item.update(d)
+                        done = True
+                if not done:
+                    try:
+                        g = protobuf_generic_decode(frame)
+                    except Exception:
+                        g = None
+                    if g:
+                        item["schema"] = False
+                        item["generic"] = g
+                if item.get("schema") is not None:
+                    results.append(item)
+        try:
+            pd = (e.get("replay") or {}).get("post_data")
+            if pd and REDACTED not in pd:
+                try:
+                    raw_req = pd.encode("latin-1")
+                except UnicodeEncodeError:
+                    raw_req = pd.encode("utf-8")
+                for frame in _iter_grpc_web_frames(raw_req)[:2]:
+                    item = {"body_file": "(request body)", "direction": "request", "bytes": len(frame)}
+                    d = dec.decode(frame, None, "request") if (dec and dec.enabled) else None
+                    if d:
+                        item["schema"] = True
+                        item.update(d)
+                    else:
+                        g = protobuf_generic_decode(frame)
+                        if g:
+                            item["schema"] = False
+                            item["generic"] = g
+                    if item.get("schema") is not None:
+                        results.append(item)
+        except Exception:
+            pass
+        if results:
+            e["protobuf_decoded"] = {"schema_based": any(r.get("schema") for r in results), "frames": results[:6]}
+
+
+# ------------------------------------------------------------------ 5) Postman collection (v2.1.0)
+
+def _postman_url_obj(raw_url: str, e) -> dict:
+    """URL de Postman con {{host}} como variable de colección (ruta/query separadas)."""
+    u = urlsplit(raw_url)
+    base = f"{u.scheme}://{u.netloc}"
+    var = "host" if base == e.get("_pm_host0") else "host_" + re.sub(r"[^A-Za-z0-9]+", "_", u.netloc).strip("_")
+    e["_pm_hostvar"] = (var, base)
+    path_segs = [x for x in (u.path or "/").split("/") if x != ""]
+    raw = "{{" + var + "}}" + (u.path or "/") + (("?" + u.query) if u.query else "")
+    obj = {"raw": raw, "host": ["{{" + var + "}}"], "path": path_segs}
+    if u.query:
+        obj["query"] = [{"key": k, "value": v} for k, v in parse_qsl(u.query, keep_blank_values=True)]
+    return obj
+
+
+def build_postman(api_map, redact: bool = True) -> dict:
+    """Colección Postman v2.1.0 con los endpoints first-party (mismos que van a OpenAPI).
+    Carpetas por rol (SEARCH/LIST/DETAIL/...). Variables de colección: {{host}} y {{token}}
+    (más una por cada secreto redactado, igual que los curl)."""
+    from wnm_curl import build_postman_parts
+    eps = [e for e in api_map.get("endpoints", []) if not e.get("likely_tracking") and not e.get("third_party")]
+    host0 = f"{eps[0].get('scheme') or 'https'}://{eps[0]['host']}" if eps else ""
+    folders: "OrderedDict[str, list]" = OrderedDict()
+    variables: "OrderedDict[str, dict]" = OrderedDict()
+    variables["host"] = {"key": "host", "value": host0, "description": "Origen (esquema + host) del sitio"}
+    variables["token"] = {"key": "token", "value": "", "description": "Valor completo del header Authorization (p.ej. 'Bearer ...')"}
+    for e in eps:
+        rp = e.get("replay") or {}
+        method = (rp.get("method") or e.get("method") or "GET").upper()
+        url = rp.get("url") or (e.get("example_urls") or [f"{host0}{e.get('path_template') or '/'}"])[0]
+        body = rp.get("post_data") if method not in ("GET", "HEAD") else None
+        parts = build_postman_parts(method, url, rp.get("headers") or {}, body, redact=redact)
+        for var, desc in (parts.get("vars") or {}).items():
+            variables.setdefault(var, {"key": var, "value": "", "description": desc})
+        e_ctx = dict(e)
+        e_ctx["_pm_host0"] = host0
+        url_obj = _postman_url_obj(parts["url"], e_ctx)
+        hv, hbase = e_ctx.get("_pm_hostvar", ("host", host0))
+        if hv not in variables:
+            variables[hv] = {"key": hv, "value": hbase, "description": "Origen adicional"}
+        req = {"method": method, "header": parts["headers"], "url": url_obj}
+        rb = e.get("request_body") or {}
+        if parts.get("binary_body"):
+            req["body"] = {"mode": "file", "file": {}}
+            req["description"] = "Cuerpo binario (protobuf/gRPC): adjunta el archivo del cuerpo capturado en bodies/."
+        elif parts.get("body") is not None:
+            if rb.get("kind") == "form" or "form-urlencoded" in (parts.get("content_type") or ""):
+                req["body"] = {"mode": "urlencoded", "urlencoded": [
+                    {"key": k, "value": v, "type": "text"} for k, v in parse_qsl(parts["body"], keep_blank_values=True)]}
+            else:
+                lang = "json" if (parts["body"].strip()[:1] in "[{") else "text"
+                req["body"] = {"mode": "raw", "raw": parts["body"], "options": {"raw": {"language": lang}}}
+        desc = [f"Rol: {e.get('role') or 'OTHER'} · Flags: {' '.join(e.get('flags') or []) or '-'}"]
+        if e.get("data_param"):
+            desc.append(f"Dato de entrada sugerido: {e['data_param'].get('in')} `{e['data_param'].get('name')}`.")
+        if e.get("suggested_replay_args"):
+            desc.append(f"Paginación: `{e['suggested_replay_args']}`")
+        req["description"] = ((req.get("description") + "\n") if req.get("description") else "") + "\n".join(desc)
+        folders.setdefault(e.get("role") or "OTHER", []).append({"name": e["key"], "request": req})
+    items = [{"name": role, "item": lst} for role, lst in folders.items()]
+    import uuid as _uuid
+    return OrderedDict([
+        ("info", {
+            "_postman_id": str(_uuid.uuid4()),
+            "name": f"API descubierta: {api_map.get('start_url')}",
+            "description": "Generado automáticamente por web-network-mapper (analyze.py) a partir del tráfico "
+                           "capturado. Completa las variables de colección {{host}} y {{token}} (y las de secretos).",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        }),
+        ("item", items),
+        ("variable", list(variables.values())),
+    ])
+
+
+def _canon_hdr(h: str) -> str:
+    return "-".join(p[:1].upper() + p[1:] for p in str(h).split("-"))
+
+
+def _schema_sample(s, depth=0):
+    """Genera un ejemplo mínimo desde un esquema inferido (para el body de Postman)."""
+    if not isinstance(s, dict) or depth > 8:
+        return None
+    types = _js_types(s)
+    non_null = [x for x in types if x != "null"]
+    tt = non_null[0] if non_null else (types[0] if types else None)
+    if tt == "object":
+        return {str(k): _schema_sample(v, depth + 1) for k, v in (s.get("properties") or {}).items()}
+    if tt == "array":
+        return [_schema_sample(s["items"], depth + 1)] if s.get("items") else []
+    if "example" in s and s["example"] != REDACTED:
+        return s["example"]
+    return {"integer": 0, "number": 0, "boolean": False, "string": ""}.get(tt, None)
+
+
+# ------------------------------------------------------------------ WS / SSE (defensivo, opcional)
+
+def _is_stream_entry(r) -> bool:
+    """True para entradas WebSocket/SSE marcadas con kind (las HTTP no traen kind o traen 'http')."""
+    return isinstance(r, dict) and str(r.get("kind") or "http").lower() in ("websocket", "sse", "ws", "eventsource")
+
+
+def load_ws_sse(run_dir: Path, recs) -> list:
+    """Lee de forma DEFENSIVA las entradas WebSocket/SSE que otro worker puede añadir:
+    - un archivo opcional ws_sse.jsonl en el run dir, y/o
+    - entradas en requests.jsonl con kind == 'websocket' | 'sse' (las HTTP no traen kind o traen 'http').
+    Nunca rompe si no existen."""
+    streams: "OrderedDict[tuple, dict]" = OrderedDict()
+
+    def _norm(w):
+        kind = str(w.get("kind") or w.get("type") or "").lower()
+        if kind in ("ws", "eventsource"):
+            kind = "websocket" if kind == "ws" else "sse"
+        url = w.get("url") or w.get("request_url") or ""
+        if not url:
+            return None  # entrada sin URL: no se puede agrupar, se ignora
+        key = (kind or "stream", url)
+        s = streams.get(key)
+        if s is None:
+            s = streams[key] = {"kind": kind or "stream", "url": url, "page": w.get("page"),
+                                "frames_sent": 0, "frames_received": 0, "messages": 0, "samples": []}
+        if not s.get("page") and w.get("page"):
+            s["page"] = w.get("page")
+        # formato consolidado (mapper.py): una línea por conexión con frames[] (WS) o events[] (SSE)
+        if isinstance(w.get("frames"), list) or isinstance(w.get("events"), list):
+            for fld in ("frames_sent", "frames_received"):
+                if isinstance(w.get(fld), int):
+                    s[fld] = max(s.get(fld, 0), w[fld])
+            if isinstance(w.get("events_total"), int):
+                s["messages"] = max(s.get("messages", 0), w["events_total"])
+            elif isinstance(w.get("events"), list):
+                s["messages"] = max(s.get("messages", 0), len(w["events"]))
+            for key_extra in ("state", "status", "source", "frames_dropped", "events_dropped", "bytes_sent",
+                              "bytes_received", "bytes"):
+                if w.get(key_extra) is not None:
+                    s[key_extra] = w[key_extra]
+            for fr in (w.get("frames") or [])[:50]:
+                if isinstance(fr, dict) and len(s["samples"]) < 5 and fr.get("payload") is not None:
+                    s["samples"].append({"dir": fr.get("dir") or fr.get("direction") or "?",
+                                         "payload": str(fr.get("payload"))[:300]})
+            for ev in (w.get("events") or [])[:50]:
+                if isinstance(ev, dict) and len(s["samples"]) < 5 and ev.get("data") is not None:
+                    s["samples"].append({"dir": ev.get("event") or "message", "payload": str(ev.get("data"))[:300]})
+            return s
+        # contadores tolerantes a distintos formatos (una línea por frame/evento)
+        for fld in ("frames_sent", "frames_received", "messages", "events"):
+            v = w.get(fld)
+            if isinstance(v, int):
+                if fld == "events":
+                    s["messages"] += v
+                else:
+                    s[fld] = max(s.get(fld, 0), v) if fld.startswith("frames") else s.get(fld, 0) + v
+        ev = str(w.get("event") or "").lower()
+        direction = w.get("direction") or w.get("dir")
+        payload = w.get("payload") or w.get("data") or w.get("message")
+        if ev == "frame" or payload is not None or ev in ("message", "event"):
+            if direction == "sent":
+                s["frames_sent"] += 1
+            elif direction in ("received", "recv"):
+                s["frames_received"] += 1
+            else:
+                s["messages"] += 1
+            if payload is not None and len(s["samples"]) < 5:
+                s["samples"].append({"dir": direction or (ev or "event"), "payload": str(payload)[:300]})
+        return s
+
+    try:
+        for w in read_jsonl(run_dir / "ws_sse.jsonl"):
+            if isinstance(w, dict):
+                _norm(w)
+    except Exception:
+        pass
+    try:
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            k = str(r.get("kind") or "").lower()
+            if k in ("websocket", "sse", "ws", "eventsource"):
+                _norm(r)
+    except Exception:
+        pass
+    return list(streams.values())
+
+
+# ------------------------------------------------------------------ 6) Reporte HTML navegable
+
+def _h(x) -> str:
+    import html as _html
+    return _html.escape("" if x is None else str(x), quote=True)
+
+
+_HTML_CSS = """
+:root{--bg:#0f1115;--card:#1a1d24;--fg:#e6e6e6;--muted:#9aa4b2;--acc:#5aa9e6;--warn:#e6a45a;--bad:#e65a5a;--ok:#5ae68b;--line:#2a2e37}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc)}
+header{padding:20px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{margin:0 0 6px;font-size:20px}
+h2{margin:26px 0 10px;font-size:17px;border-left:3px solid var(--acc);padding-left:10px}
+h3{margin:16px 0 6px;font-size:15px}
+.wrap{max-width:1200px;margin:0 auto;padding:0 24px 60px}
+.meta{color:var(--muted);font-size:13px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.chip{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-size:12px}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}
+th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+th{background:var(--card);position:sticky;top:0}
+tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:12px}
+.flag{display:inline-block;background:#22303f;color:var(--acc);border-radius:4px;padding:1px 6px;margin:1px;font-size:11px}
+.flag.DATA{background:#1e3a2a;color:var(--ok)}
+.flag.TRACKING,.flag.THIRD_PARTY{background:#3a2a1e;color:var(--warn)}
+.flag.AUTH_HEADER,.flag.ISSUES_TOKEN,.flag.RATE_LIMIT{background:#3a1e2a;color:var(--bad)}
+details{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:8px 0}
+summary{cursor:pointer;font-weight:600}
+input#filter{width:100%;max-width:420px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0b0d11;color:var(--fg);margin:8px 0}
+.tag{color:var(--muted);font-size:12px}
+.human{color:var(--warn)}
+.note{color:var(--muted);font-size:12px;margin:4px 0}
+.kbd{background:#0b0d11;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12px}
+.fd{display:flex;flex-direction:column;align-items:flex-start;margin:10px 0}
+.fd-box{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:8px;padding:6px 12px;min-width:420px;max-width:100%}
+.fd-box.doc-box{border-left-color:var(--muted)}
+.fd-box.form-box{border-left-color:var(--warn)}
+.fd-box.human-box{border-left-color:var(--bad);background:#2a1a1a}
+.fd-n{font-weight:700;color:var(--acc);min-width:22px}
+.fd-arrow{color:var(--muted);margin:0 0 0 18px;line-height:1.1}
+.fd-tok{font-size:11px;color:var(--warn)}
+"""
+
+_HTML_JS = """
+function wnmFilter(){
+  var q=document.getElementById('filter').value.toLowerCase();
+  var rows=document.querySelectorAll('#ep-table tbody tr');
+  rows.forEach(function(r){
+    r.style.display = r.innerText.toLowerCase().indexOf(q)>=0 ? '' : 'none';
+  });
+}
+"""
+
+
+def _flags_html(flags):
+    return "".join(f'<span class="flag {_h(f)}">{_h(f)}</span>' for f in (flags or [])) or '<span class="tag">-</span>'
+
+
+def render_html(m, pages, failed, run_dir: Path) -> str:
+    P = []
+    P.append("<!doctype html><html lang='es'><head><meta charset='utf-8'>")
+    P.append("<meta name='viewport' content='width=device-width,initial-scale=1'>")
+    P.append(f"<title>Reporte web-network-mapper: {_h(m.get('start_url'))}</title>")
+    P.append("<style>" + _HTML_CSS + "</style></head><body>")
+    P.append("<header><div class='wrap'>")
+    P.append(f"<h1>Reporte de red — {_h(m.get('start_url'))}</h1>")
+    P.append("<div class='meta'>Generado por web-network-mapper (analyze.py). Autocontenido, sin dependencias externas.</div>")
+    P.append(f"<div class='meta'>Run dir: <code>{_h(m.get('run_dir'))}</code></div>")
+    P.append("</div></header><div class='wrap'>")
+
+    # resumen
+    P.append("<div class='chips'>")
+    P.append(f"<span class='chip'>Páginas: {_h(m.get('pages_visited'))}</span>")
+    P.append(f"<span class='chip'>Requests: {_h(m.get('total_requests'))}</span>")
+    P.append(f"<span class='chip'>Endpoints: {_h(m.get('endpoint_count'))} ({_h(m.get('data_endpoint_count'))} de datos)</span>")
+    P.append(f"<span class='chip'>Secretos: {'redactados' if m.get('redacted') else 'REALES (--keep-secrets)'}</span>")
+    roles = m.get("endpoint_roles") or {}
+    for r, c in roles.items():
+        P.append(f"<span class='chip'>{_h(r)}: {_h(c)}</span>")
+    ab = m.get("anti_bot") or []
+    if ab:
+        P.append(f"<span class='chip'>Anti-bot: {_h(', '.join(a['vendor'] for a in ab))}</span>")
+    P.append("</div>")
+    # archivos generados
+    files = []
+    for label, key in [("OpenAPI", "openapi_file"), ("JSON Schema", "json_schema_file"),
+                       ("Postman", "postman_file"), ("replay.sh", "replay_script"),
+                       ("flow.md", "flow_md"), ("curls.sh", "curls_file")]:
+        if m.get(key):
+            files.append(f"<code>{_h(Path(m[key]).name)}</code>")
+    if files:
+        P.append("<div class='note'>Archivos generados: " + " · ".join(files) + "</div>")
+
+    main = [e for e in m["endpoints"] if not e["likely_tracking"]]
+
+    # diagrama del flujo (mermaid como texto, offline)
+    flow = m.get("flow") or []
+    if flow:
+        P.append("<h2>Diagrama del flujo</h2>")
+        P.append("<div class='note'>Diagrama del flujo dibujado en HTML/CSS (sin JS remoto). Rojo = paso humano "
+                 "(captcha), naranja = envío de formulario, gris = página. Abajo, el mismo diagrama en sintaxis Mermaid "
+                 "(bloque de texto) para pegarlo en un visor Mermaid o Markdown compatible.</div>")
+        lines = ["flowchart TD"]
+        prev = None
+        for s in flow[:40]:
+            nid = f"s{s['step']}"
+            lbl = f"{s['step']}. {s['method']} {urlsplit(s['url']).path or '/'}"[:60]
+            lbl = lbl.replace('"', "'")
+            mark = " 🧑" if s.get("needs_human") else ""
+            lines.append(f'  {nid}["{lbl}{mark}"]')
+            if prev:
+                lines.append(f"  {prev} --> {nid}")
+            prev = nid
+        # diagrama visual simple en HTML/CSS (sin JS)
+        P.append("<div class='fd'>")
+        for s in flow[:60]:
+            cls = "fd-box"
+            if s.get("needs_human"):
+                cls += " human-box"
+            elif s.get("is_form_submit"):
+                cls += " form-box"
+            elif s.get("is_document"):
+                cls += " doc-box"
+            toks = ""
+            if s.get("issues_tokens"):
+                toks += "<div class='fd-tok'>🔑 emite: " + _h(", ".join(t["name"] for t in s["issues_tokens"][:3])) + "</div>"
+            if s.get("consumes_tokens"):
+                toks += "<div class='fd-tok'>↳ usa: " + _h(", ".join(f"{t['name']} (paso {t['from_step']})" for t in s["consumes_tokens"][:3])) + "</div>"
+            P.append(f"<div class='{cls}'><div class='fd-n'>{_h(s['step'])}</div>"
+                     f"<div><b>{_h(s['method'])}</b> <code>{_h((urlsplit(s['url']).path or '/')[:70])}</code> "
+                     f"<span class='tag'>{_h(s['status'])}</span>{' 🧑' if s.get('needs_human') else ''}{toks}</div></div>")
+            P.append("<div class='fd-arrow'>↓</div>")
+        if P and P[-1] == "<div class='fd-arrow'>↓</div>":
+            P.pop()
+        P.append("</div>")
+        P.append("<details><summary>Mismo diagrama en sintaxis Mermaid</summary>")
+        P.append("<pre>```mermaid\n" + _h("\n".join(lines)) + "\n```</pre></details>")
+
+    # endpoints
+    P.append("<h2>Endpoints</h2>")
+    if not main:
+        P.append("<div class='note'>No se capturaron endpoints XHR/fetch/JSON. El sitio puede ser renderizado en "
+                 "servidor: revisa las páginas HTML y los datos embebidos.</div>")
+    else:
+        P.append("<input id='filter' onkeyup='wnmFilter()' placeholder='Filtrar endpoints (texto, flag, rol, host)…'>")
+        P.append("<table id='ep-table'><thead><tr><th>#</th><th>Endpoint</th><th>Rol</th><th>Llamadas</th>"
+                 "<th>Status</th><th>Respuesta</th><th>Dato entrada</th><th>Flags</th></tr></thead><tbody>")
+        for e in main:
+            dp = e.get("data_param")
+            dp_txt = (f"{_h(dp['in'])}:{_h(dp['name'])}" if dp else "-")
+            P.append("<tr>")
+            P.append(f"<td>{_h(e['index'])}</td>")
+            P.append(f"<td><code>{_h(e['key'])}</code></td>")
+            P.append(f"<td>{_h(e.get('role') or '-')}</td>")
+            P.append(f"<td>{_h(e['calls'])}</td>")
+            P.append(f"<td>{_h(_fmt_counter(e['statuses']))}</td>")
+            P.append(f"<td>{_h(', '.join(e['response_content_types']) or '-')}</td>")
+            P.append(f"<td>{dp_txt}</td>")
+            P.append(f"<td>{_flags_html(e['flags'])}</td>")
+            P.append("</tr>")
+        P.append("</tbody></table>")
+        # detalle colapsable por endpoint
+        for e in main:
+            P.append(f"<details><summary>{_h(e['index'])}. {_h(e['key'])}</summary>")
+            P.append(f"<div class='note'>Rol: <b>{_h(e.get('role') or 'OTHER')}</b> · Flags: {_flags_html(e['flags'])}</div>")
+            if e.get("example_urls"):
+                P.append(f"<div class='note'>Ejemplo: <code>{_h(e['example_urls'][0])}</code></div>")
+            dp = e.get("data_param")
+            if dp:
+                P.append(f"<div class='note'>Dato de entrada sugerido ({_h(dp.get('note'))}): "
+                         f"<span class='kbd'>{_h(dp.get('in'))} {_h(dp.get('name'))}</span>"
+                         + (f" — ej. <code>{_h(dp.get('example'))}</code>" if dp.get('example') else "") + "</div>")
+            if e.get("query_params"):
+                qp = "; ".join(f"<code>{_h(k)}</code>=" + ", ".join(_h(x) for x in (v.get('values') or [])[:5])
+                               for k, v in e["query_params"].items())
+                P.append(f"<div class='note'>Query params: {qp}</div>")
+            rec = e.get("response_records")
+            if rec:
+                P.append(f"<div class='note'>Registros: <code>{_h(rec['jsonpath'])}</code> "
+                         f"({_h(rec['length'])} items) — claves: {_h(', '.join(rec['item_keys'][:15]))}</div>")
+            if e.get("suggested_replay_args") is not None:
+                P.append(f"<div class='note'>Replay: <code>wnm-replay api_map.json {_h(e['index'])} "
+                         f"{_h(e.get('suggested_replay_args') or '')} --max-pages 5</code></div>")
+            pdq = e.get("protobuf_decoded")
+            if pdq:
+                P.append(f"<div class='note'>Protobuf {'(con esquema)' if pdq.get('schema_based') else '(genérico sin esquema)'} — "
+                         f"{len(pdq.get('frames') or [])} frame(s) decodificado(s).</div>")
+                fr = (pdq.get("frames") or [])[:1]
+                if fr:
+                    body = fr[0].get("json") or fr[0].get("generic")
+                    P.append("<pre>" + _h(json.dumps(body, indent=2, ensure_ascii=False, default=str)[:2000]) + "</pre>")
+            if e.get("response_schema"):
+                P.append("<b>Esquema de respuesta (inferido)</b>")
+                P.append("<pre>" + _h("\n".join(schema_outline(e["response_schema"], max_lines=35))) + "</pre>")
+            if e.get("curl"):
+                P.append("<b>curl (llamada representativa)</b>")
+                P.append("<pre>" + _h(e["curl"]) + "</pre>")
+            P.append("</details>")
+
+    # flujo
+    if flow:
+        P.append("<h2>Flujo completo (inicio a fin)</h2>")
+        if m.get("flow_needs_human"):
+            P.append("<div class='note human'>🧑 El flujo tiene pasos que requieren un humano (captcha u otro desafío).</div>")
+        P.append("<table><thead><tr><th>Paso</th><th>Método</th><th>URL</th><th>Status</th><th>Tipo</th><th>Humano</th></tr></thead><tbody>")
+        for s in flow:
+            kind = "captcha" if s.get("is_captcha_asset") else ("form POST" if s.get("is_form_submit")
+                   else ("página" if s.get("is_document") else s.get("resource_type") or "-"))
+            P.append("<tr>")
+            P.append(f"<td>{_h(s['step'])}</td><td>{_h(s['method'])}</td>"
+                     f"<td><code>{_h(s['url'][:120])}</code></td><td>{_h(s['status'])}</td>"
+                     f"<td>{_h(kind)}</td><td>{'🧑' if s.get('needs_human') else ''}</td>")
+            P.append("</tr>")
+        P.append("</tbody></table>")
+
+    # auth / tokens
+    af = m.get("auth_flow") or {}
+    toks = af.get("tokens") or []
+    P.append("<h2>Autenticación / tokens</h2>")
+    if not toks:
+        P.append("<div class='note'>No se detectaron tokens (cookies de sesión, Bearer/JWT, CSRF/ViewState).</div>")
+    else:
+        P.append("<table><thead><tr><th>Token</th><th>Tipo</th><th>Emitido por</th><th>Usado por</th><th>Transporte</th></tr></thead><tbody>")
+        for t in toks[:40]:
+            iss = "<br>".join(_h(f"{i['endpoint'][:60]} (seq {i['seq']})") for i in t["issued_by"][:2]) or "<span class='tag'>(previo a la captura)</span>"
+            con = "<br>".join(_h(f"{c['endpoint'][:60]} ×{c['count']}") for c in t["consumed_by"][:4]) or "-"
+            P.append(f"<tr><td><code>{_h(t['name'])}</code></td><td>{_h(t['kind'])}"
+                     f"{' (sesión)' if t.get('session_like') else ''}</td><td>{iss}</td><td>{con}</td>"
+                     f"<td>{_h(t['carried_by'])}</td></tr>")
+        P.append("</tbody></table>")
+
+    # anti-bot
+    P.append("<h2>Protección anti-bot</h2>")
+    if not ab:
+        P.append("<div class='note'>No se detectaron proveedores anti-bot conocidos ni desafíos JS genéricos.</div>")
+    else:
+        for a in ab:
+            P.append(f"<h3>{_h(a['vendor'])} — {'desafío ACTIVO' if a.get('active') else 'señales pasivas'} "
+                     f"({_h(a['requests'])} request(s))</h3>")
+            P.append(f"<div class='note'>Evidencia: {_h(', '.join(a['evidence'][:8]))}</div>")
+            P.append(f"<div class='note'>Estrategia: {_h(a['strategy'])}</div>")
+
+    # rate limit
+    rls = m.get("rate_limit_summary") or {}
+    if rls.get("endpoints_with_rate_limit"):
+        P.append("<h2>Rate limit</h2>")
+        P.append(f"<div class='note'>{_h(rls['endpoints_with_rate_limit'])} endpoint(s) con señales de rate limit; "
+                 f"{_h(rls.get('status_429_total', 0))} respuesta(s) 429.</div>")
+        P.append("<ul>")
+        for n in rls.get("notes") or []:
+            P.append(f"<li><code>{_h(n['endpoint'])}</code>: {_h(n['note'])}</li>")
+        P.append("</ul>")
+
+    # ws / sse
+    wss = m.get("ws_sse") or []
+    legacy_ws = m.get("websockets") or []
+    if wss or legacy_ws:
+        P.append("<h2>WebSocket / SSE</h2>")
+        for w in legacy_ws:
+            P.append(f"<div class='note'>WS <code>{_h(w['url'])}</code> — enviados {_h(w['frames_sent'])}, "
+                     f"recibidos {_h(w['frames_received'])}</div>")
+            for s in w.get("samples", [])[:3]:
+                P.append(f"<div class='note'>&nbsp;&nbsp;{_h(s['dir'])}: <code>{_h(s['payload'][:150])}</code></div>")
+        for w in wss:
+            P.append(f"<div class='note'>{_h((w.get('kind') or 'stream').upper())} <code>{_h(w.get('url'))}</code> — "
+                     f"enviados {_h(w.get('frames_sent', 0))}, recibidos {_h(w.get('frames_received', 0))}, "
+                     f"mensajes {_h(w.get('messages', 0))}</div>")
+            for s in (w.get("samples") or [])[:3]:
+                P.append(f"<div class='note'>&nbsp;&nbsp;{_h(s.get('dir'))}: <code>{_h(str(s.get('payload'))[:150])}</code></div>")
+
+    P.append("<script>" + _HTML_JS + "</script>")
+    P.append("</div></body></html>")
+    return "\n".join(P)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir")
@@ -2179,8 +3612,32 @@ def main():
     g2.add_argument("--no-openapi", dest="openapi", action="store_false", help="do not write openapi.json")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable output: print only the JSON summary on stdout (notes go to stderr)")
+    g3 = ap.add_mutually_exclusive_group()
+    g3.add_argument("--json-schema", dest="json_schema", action="store_true", default=True,
+                    help="write schemas/<endpoint>.schema.json + schemas.json (JSON Schema 2020-12) (default: on)")
+    g3.add_argument("--no-json-schema", dest="json_schema", action="store_false", help="do not write JSON Schemas")
+    g4 = ap.add_mutually_exclusive_group()
+    g4.add_argument("--postman", dest="postman", action="store_true", default=True,
+                    help="write postman_collection.json (Postman v2.1.0) (default: on)")
+    g4.add_argument("--no-postman", dest="postman", action="store_false", help="do not write postman_collection.json")
+    g5 = ap.add_mutually_exclusive_group()
+    g5.add_argument("--html", dest="html", action="store_true", default=True,
+                    help="write report.html, a self-contained offline report (default: on)")
+    g5.add_argument("--no-html", dest="html", action="store_false", help="do not write report.html")
+    g6 = ap.add_mutually_exclusive_group()
+    g6.add_argument("--replay-script", dest="replay_script", action="store_true", default=True,
+                    help="write replay.sh with one wnm-replay command per data endpoint (default: on)")
+    g6.add_argument("--no-replay-script", dest="replay_script", action="store_false", help="do not write replay.sh")
+    ap.add_argument("--proto", metavar="FILE|DIR",
+                    help="a .proto file or a directory of .proto files, used to decode protobuf/gRPC-web bodies to JSON")
+    ap.add_argument("--descriptor", metavar="FDS",
+                    help="a FileDescriptorSet (protoc --descriptor_set_out --include_imports) to decode protobuf bodies")
+    ap.add_argument("--proto-message", metavar="TYPE",
+                    help="with --proto/--descriptor: force this message type (e.g. pkg.Response) instead of auto-detect")
     a = ap.parse_args()
-    s = build(a.run_dir, a.map_documents, a.emit_curl, a.curl_secrets, a.curl_redact, write_openapi=a.openapi)
+    s = build(a.run_dir, a.map_documents, a.emit_curl, a.curl_secrets, a.curl_redact, write_openapi=a.openapi,
+              write_json_schema=a.json_schema, write_postman=a.postman, write_html=a.html,
+              write_replay=a.replay_script, proto=a.proto, descriptor=a.descriptor, proto_message=a.proto_message)
     if a.json:
         print(json.dumps(s, ensure_ascii=False, sort_keys=False, default=list))
     else:

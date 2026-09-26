@@ -5,3 +5,6 @@ brotli>=1.1
 zstandard>=0.22
 # optional but recommended: Shodan-style favicon hashing in recon.py
 mmh3>=4.0
+# optional: real protobuf/gRPC body decoding in analyze.py (--proto needs grpcio-tools; --descriptor needs only protobuf)
+protobuf>=5.26
+grpcio-tools>=1.62

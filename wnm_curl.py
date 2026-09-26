@@ -176,3 +176,44 @@ def env_comment(env: dict) -> str:
     if not env:
         return ""
     return "\n".join(f"# export {k}='...'   # {d}" for k, d in env.items())
+
+
+# ------------------------------------------------------------------ Postman (additive)
+
+_PM_RE = _PH_RE  # same internal placeholder marker, rendered as {{VAR}} for Postman
+
+
+def _pm(s: str) -> str:
+    return _PM_RE.sub(lambda m: "{{" + m.group(1) + "}}", s)
+
+
+def build_postman_parts(method: str, url: str, headers: dict | None, body: str | None, redact: bool = True,
+                        token_var: str = "token") -> dict:
+    """Pieces for a Postman v2.1 request, reusing the curl redaction rules.
+
+    Returns {"headers": [{key, value}], "url": str (secrets as {{VAR}}), "body": str | None,
+    "binary_body": bool, "vars": {VAR: desc}}. The Authorization header value becomes {{token_var}}."""
+    v = _Vars()
+    hdrs = []
+    ct = None
+    for k, val in (headers or {}).items():
+        kl = k.lower()
+        if kl.startswith(":") or kl in _SKIP or kl in ("content-length", "cookie"):
+            continue
+        val = "" if val is None else str(val)
+        if kl == "content-type":
+            ct = val
+        if kl == "authorization" and (val == REDACTED or REDACTED in val or (redact and val)):
+            val = "{{" + token_var + "}}"
+        elif val == REDACTED or REDACTED in val or (redact and is_sensitive_header(kl) and val):
+            val = _pm(v.ph(kl, f"value of the {k} header"))
+        hdrs.append({"key": _canon(k), "value": val})
+    out_url = _pm(_redact_url(url, v, redact))
+    out_body, binary = None, False
+    if body:
+        if _is_binary(body):
+            binary = True
+        else:
+            out_body = _pm(_redact_body(body, ct, v, redact))
+    return {"headers": hdrs, "url": out_url, "body": out_body, "binary_body": binary, "vars": v.vars,
+            "content_type": ct}

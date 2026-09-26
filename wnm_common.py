@@ -575,3 +575,212 @@ def guard_target(target: str, kind: str = "url"):
             "Si tienes autorización explícita para probar este sitio, ejecuta de nuevo con "
             "la variable de entorno WNM_ALLOW_RESTRICTED=1."
         )
+
+
+# ------------------------------------------------------------------ session / captcha cache
+# Reusable cache of a resolved browser session (Playwright storage_state: cookies + localStorage),
+# one JSON file per domain, so a human does not have to repeat login/captcha on every run.
+# Location: $WNM_SESSION_CACHE_DIR if set, else ~/.cache/wnm/sessions/ (dir 0700, files 0600).
+# It lives OUTSIDE the tool dir on purpose so it never ends up in the tool zip / shared runs.
+# TTL: $WNM_SESSION_TTL (seconds, or with suffix s/m/h/d, e.g. "12h"); default 24h.
+# The files contain live secrets (cookie values). Only summaries (counts, cookie *names*, age)
+# are meant to be logged or written to run_meta.json; never print the storage_state itself.
+import time as _time
+from datetime import datetime as _datetime
+
+SESSION_CACHE_VERSION = 1
+SESSION_TTL_DEFAULT = 24 * 3600
+
+
+def session_ttl() -> int:
+    """TTL in seconds from WNM_SESSION_TTL ('86400', '90m', '12h', '2d'). Bad values -> default."""
+    raw = (_os.environ.get("WNM_SESSION_TTL") or "").strip().lower()
+    if not raw:
+        return SESSION_TTL_DEFAULT
+    try:
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(raw[-1])
+        val = float(raw[:-1]) * mult if mult else float(raw)
+        return int(val) if val > 0 else SESSION_TTL_DEFAULT
+    except Exception:
+        return SESSION_TTL_DEFAULT
+
+
+def session_domain(target: str) -> str:
+    """Cache key for a URL or host: lowercase hostname without port and without a leading 'www.'."""
+    t = (target or "").strip().lower()
+    try:
+        host = (_urlsplit(t).hostname or "") if "//" in t else t.split("/")[0].split(":")[0]
+    except Exception:
+        host = t
+    host = host.rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def session_cache_dir(create: bool = True) -> Path:
+    env = (_os.environ.get("WNM_SESSION_CACHE_DIR") or "").strip()
+    d = Path(env).expanduser() if env else Path.home() / ".cache" / "wnm" / "sessions"
+    if create:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            _os.chmod(d, 0o700)
+        except Exception:
+            pass
+    return d
+
+
+def session_cache_path(domain: str) -> Path:
+    return session_cache_dir(create=False) / f"{slugify(session_domain(domain), 120)}.json"
+
+
+def session_summary(storage_state) -> dict:
+    """Secret-free summary of a storage_state (counts + cookie names only)."""
+    try:
+        st = storage_state or {}
+        cookies = st.get("cookies") or []
+        origins = st.get("origins") or []
+        return {"cookies": len(cookies),
+                "cookie_names": sorted({str(c.get("name")) for c in cookies if isinstance(c, dict)})[:40],
+                "origins": len(origins),
+                "local_storage_keys": sum(len(o.get("localStorage") or []) for o in origins if isinstance(o, dict))}
+    except Exception:
+        return {"cookies": 0, "cookie_names": [], "origins": 0, "local_storage_keys": 0}
+
+
+def _drop_expired_cookies(st: dict, now: float) -> tuple[dict, int]:
+    cookies = st.get("cookies") or []
+    keep = [c for c in cookies if not (isinstance(c, dict) and isinstance(c.get("expires"), (int, float))
+                                       and 0 < c["expires"] < now)]
+    out = dict(st)
+    out["cookies"] = keep
+    out.setdefault("origins", [])
+    return out, len(cookies) - len(keep)
+
+
+def save_session(domain: str, storage_state: dict, extra: dict | None = None) -> dict:
+    """Persist a storage_state for `domain` (atomic write, chmod 600). Never raises.
+    Returns a secret-free info dict: {ok, path, saved_at, saved_iso, summary} or {ok: False, error}."""
+    try:
+        if not isinstance(storage_state, dict):
+            raise ValueError("storage_state debe ser un dict")
+        dom = session_domain(domain)
+        if not dom:
+            raise ValueError("dominio vacío")
+        session_cache_dir(create=True)
+        path = session_cache_path(dom)
+        now = _time.time()
+        doc = {"version": SESSION_CACHE_VERSION, "domain": dom, "saved_at": now,
+               "saved_iso": _datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
+               "summary": session_summary(storage_state), "extra": extra or {},
+               "storage_state": storage_state}
+        tmp = path.with_name(f".{path.name}.{_os.getpid()}.tmp")
+        fd = _os.open(str(tmp), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        with _os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        _os.replace(tmp, path)
+        try:
+            _os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return {"ok": True, "path": str(path), "saved_at": now, "saved_iso": doc["saved_iso"],
+                "summary": doc["summary"]}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+
+def load_session(domain: str, ttl: int | None = None) -> dict:
+    """Load the cached session for `domain`. Never raises.
+    Returns {status, path, ttl_s, age_s?, saved_iso?, storage_state?, summary?, extra?, expired_cookies_dropped?, error?}
+    status: 'hit' | 'miss' (no file) | 'expired' (older than TTL) | 'corrupt' | 'empty' (no usable cookies/storage).
+    Only when status == 'hit' is `storage_state` present (dict usable as Playwright new_context(storage_state=...))."""
+    ttl = session_ttl() if ttl is None else int(ttl)
+    info: dict = {"status": "miss", "ttl_s": ttl}
+    try:
+        path = session_cache_path(domain)
+        info["path"] = str(path)
+        if not path.exists():
+            return info
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            st = doc.get("storage_state")
+            saved_at = float(doc.get("saved_at"))
+            if not isinstance(st, dict):
+                raise ValueError("storage_state ausente")
+        except Exception as e:
+            info.update(status="corrupt", error=f"{type(e).__name__}: {str(e)[:160]}")
+            return info
+        now = _time.time()
+        info["age_s"] = int(max(0, now - saved_at))
+        info["saved_iso"] = doc.get("saved_iso")
+        if ttl > 0 and now - saved_at > ttl:
+            info["status"] = "expired"
+            return info
+        st, dropped = _drop_expired_cookies(st, now)
+        if dropped:
+            info["expired_cookies_dropped"] = dropped
+        summ = session_summary(st)
+        if not summ["cookies"] and not summ["local_storage_keys"]:
+            info["status"] = "empty"
+            return info
+        info.update(status="hit", storage_state=st, summary=summ, extra=doc.get("extra") or {})
+        return info
+    except Exception as e:
+        info.update(status="corrupt", error=f"{type(e).__name__}: {str(e)[:160]}")
+        return info
+
+
+def delete_session(domain: str) -> bool:
+    """Remove the cached session file for `domain` (e.g. after it proved invalid). Never raises."""
+    try:
+        p = session_cache_path(domain)
+        if p.exists():
+            p.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ------------------------------------------------------------------ SSE parsing
+def parse_sse(text: str, max_events: int = 1000, max_data: int = 65536) -> tuple[list[dict], str]:
+    """Parse a text/event-stream chunk into events. Returns (events, leftover_incomplete_text).
+    Each event: {"event": str ("message" if absent), "data": str, "id": str|None, "retry": int|None}.
+    Comment lines (':') are ignored. Feed leftover back with the next chunk for streaming use."""
+    events: list[dict] = []
+    if not text:
+        return events, ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = t.split("\n\n")
+    leftover = blocks.pop()  # last piece is incomplete unless text ended with a blank line
+    for blk in blocks:
+        if len(events) >= max_events:
+            break
+        ev = {"event": "message", "data": [], "id": None, "retry": None}
+        seen = False
+        for line in blk.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            field, _, val = line.partition(":")
+            if val.startswith(" "):
+                val = val[1:]
+            if field == "data":
+                ev["data"].append(val)
+                seen = True
+            elif field == "event":
+                ev["event"] = val or "message"
+                seen = True
+            elif field == "id":
+                ev["id"] = val
+                seen = True
+            elif field == "retry":
+                try:
+                    ev["retry"] = int(val)
+                    seen = True
+                except ValueError:
+                    pass
+        if seen:
+            data = "\n".join(ev["data"])
+            ev["data"] = data[:max_data]
+            if len(data) > max_data:
+                ev["truncated"] = True
+            events.append(ev)
+    return events, leftover

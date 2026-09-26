@@ -7,6 +7,7 @@ Outputs (per run, default <tool>/runs/<domain>-<timestamp>/):
   network.har      standard HAR recorded by Playwright
   bodies/          saved response bodies (XHR/fetch/document/JSON by default)
   websockets.jsonl WebSocket frames (if any)
+  ws_sse.jsonl     one record per WebSocket connection / SSE stream (frames/events consolidated)
   pages.json       site map (url, title, status, links, API calls triggered)
   api_map.json/.md deduplicated endpoint map (built by analyze.py)
   run_meta.json    arguments, timings, counts
@@ -38,6 +39,12 @@ from wnm_common import (  # noqa: E402
     parse_header_args, redact_headers, redact_post_data, redact_url, slugify, guard_target,
     detect_body_kind,
 )
+try:  # session cache + SSE helpers (additive; degrade if an older wnm_common is present)
+    from wnm_common import (  # noqa: E402
+        load_session, save_session, session_domain, session_summary, session_ttl, parse_sse, redact_obj,
+    )
+except Exception:  # pragma: no cover
+    load_session = save_session = session_domain = session_summary = session_ttl = parse_sse = redact_obj = None
 
 SKIP_EXT = re.compile(
     r"\.(pdf|zip|gz|tgz|rar|7z|exe|dmg|msi|apk|iso|bin|jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff?|"
@@ -109,6 +116,20 @@ class Capture:
         self.auto_attach = {"enabled": bool(getattr(args, "auto_attach", True)), "status": "not_started",
                             "mode": None, "targets_attached": {}, "child_requests": 0,
                             "duplicates_skipped": 0, "notes": []}
+        # consolidated WebSocket / SSE capture -> ws_sse.jsonl (disabled with --no-ws)
+        self.ws_enabled = not bool(getattr(args, "no_ws", False))
+        self.wsx: dict[str, dict] = {}            # key -> websocket connection record (open)
+        self.ssex: dict[str, dict] = {}           # key -> SSE stream record (open)
+        self._ssex_buf: dict[str, str] = {}       # key -> incomplete SSE text awaiting more data
+        self._ssex_streaming: set[str] = set()    # keys with Network.streamResourceContent active
+        self._wsx_main_seen: set[str] = set()     # raw requestIds of WebSockets seen on the main session
+        self._wall_offset: float | None = None    # wallTime - monotonic timestamp (CDP)
+        self.ws_sse_out = None
+        self.ws_sse = {"enabled": self.ws_enabled, "file": "ws_sse.jsonl" if self.ws_enabled else None, "websocket_connections": 0,
+                       "websocket_frames": 0, "websocket_frames_sent": 0, "websocket_frames_received": 0,
+                       "websocket_frames_dropped": 0, "websocket_child_connections": 0,
+                       "websocket_duplicates_skipped": 0, "sse_streams": 0, "sse_events": 0,
+                       "sse_sources": {}, "notes": []}
 
     # -------- attach
     async def attach(self, page):
@@ -126,6 +147,7 @@ class Capture:
         on("Network.webSocketFrameReceived", lambda p: self._on_ws_frame(p, "received"))
         on("Network.webSocketClosed", self._on_ws_closed)
         on("Network.eventSourceMessageReceived", self._on_sse)
+        self._attach_ws_sse(on)
         params = {"maxTotalBufferSize": 256 * 1024 * 1024, "maxResourceBufferSize": 64 * 1024 * 1024,
                   "maxPostDataSize": 1024 * 1024}
         try:
@@ -259,6 +281,7 @@ class Capture:
                 "Network.webSocketClosed": self._on_ws_closed,
                 "Network.eventSourceMessageReceived": self._on_sse,
             }.get(method)
+            self._ws_sse_child(method, params, sid)
             if handler is None:
                 return
             handler(params)
@@ -499,11 +522,15 @@ class Capture:
         return self.ws_out
 
     def _on_ws_created(self, p):
+        if not self.ws_enabled:
+            return
         self.ws_meta[p["requestId"]] = {"url": p.get("url"), "page": self.current_page}
         self._write_ws({"event": "created", "request_id": p["requestId"], "url": self._u(p.get("url")),
                         "page": self.current_page, "time": now_iso()})
 
     def _on_ws_frame(self, p, direction):
+        if not self.ws_enabled:
+            return
         meta = self.ws_meta.get(p.get("requestId"), {})
         resp = p.get("response") or {}
         payload = resp.get("payloadData") or ""
@@ -515,6 +542,8 @@ class Capture:
                         "time": now_iso()})
 
     def _on_ws_closed(self, p):
+        if not self.ws_enabled:
+            return
         self._write_ws({"event": "closed", "request_id": p.get("requestId"), "time": now_iso()})
 
     def _on_sse(self, p):
@@ -535,6 +564,475 @@ class Capture:
 
     def _u(self, u):
         return u if self.args.keep_secrets or not u else redact_url(u)
+
+    # -------- consolidated WebSocket / SSE capture (ws_sse.jsonl)
+    # One JSON line per WebSocket connection ("kind": "websocket", with "frames") or per SSE stream
+    # ("kind": "sse", with "events"), written when the connection closes / the stream ends, and at the
+    # end of the run for anything still open. requests.jsonl is left untouched.
+    _WS_OPCODES = {0: "continuation", 1: "text", 2: "binary", 8: "close", 9: "ping", 10: "pong"}
+
+    def _attach_ws_sse(self, on):
+        if not self.ws_enabled:
+            return
+        try:
+            on("Network.webSocketCreated", self._wsx_created)
+            on("Network.webSocketWillSendHandshakeRequest", self._wsx_hs_request)
+            on("Network.webSocketHandshakeResponseReceived", self._wsx_hs_response)
+            on("Network.webSocketFrameSent", lambda p: self._wsx_frame(p, "sent"))
+            on("Network.webSocketFrameReceived", lambda p: self._wsx_frame(p, "received"))
+            on("Network.webSocketFrameError", self._wsx_error)
+            on("Network.webSocketClosed", self._wsx_closed)
+            on("Network.responseReceived", self._ssex_response)
+            on("Network.eventSourceMessageReceived", self._ssex_es_message)
+            on("Network.dataReceived", self._ssex_data)
+            on("Network.loadingFinished", self._ssex_finished)
+            on("Network.loadingFailed", self._ssex_failed)
+        except Exception as e:
+            self._ws_note(f"no se pudo registrar la captura WS/SSE: {str(e)[:160]}")
+
+    def _ws_sse_child(self, method, params, sid):
+        """Same WS/SSE handlers for auto-attached child targets (iframes / workers). Never raises."""
+        if not self.ws_enabled:
+            return
+        try:
+            h = {
+                "Network.webSocketCreated": self._wsx_created,
+                "Network.webSocketWillSendHandshakeRequest": self._wsx_hs_request,
+                "Network.webSocketHandshakeResponseReceived": self._wsx_hs_response,
+                "Network.webSocketFrameSent": lambda q: self._wsx_frame(q, "sent"),
+                "Network.webSocketFrameReceived": lambda q: self._wsx_frame(q, "received"),
+                "Network.webSocketFrameError": self._wsx_error,
+                "Network.webSocketClosed": self._wsx_closed,
+                "Network.eventSourceMessageReceived": self._ssex_es_message,
+                "Network.dataReceived": self._ssex_data,
+                "Network.loadingFinished": self._ssex_finished,
+                "Network.loadingFailed": self._ssex_failed,
+            }.get(method)
+            if h is not None:
+                h(params)
+            elif method == "Network.responseReceived":
+                # the record still lacks the response here; pass the child target info explicitly
+                self._ssex_response(params, child=self.children.get(sid) or {"type": "child"})
+        except Exception as e:
+            log("WARN captura WS/SSE en target hijo:", e)
+
+    def _ws_note(self, note):
+        try:
+            notes = self.ws_sse["notes"]
+            if note not in notes and len(notes) < 20:
+                notes.append(note)
+        except Exception:
+            pass
+
+    def _wall(self, ts=None):
+        """Epoch seconds for a CDP monotonic timestamp (falls back to the local clock)."""
+        try:
+            if ts is not None and self._wall_offset is not None:
+                return round(float(ts) + self._wall_offset, 3)
+        except Exception:
+            pass
+        return round(time.time(), 3)
+
+    @staticmethod
+    def _iso(epoch):
+        try:
+            return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="milliseconds")
+        except Exception:
+            return now_iso()
+
+    def _learn_offset(self, wall, ts):
+        try:
+            if wall and ts:
+                self._wall_offset = float(wall) - float(ts)
+        except Exception:
+            pass
+
+    def _target_of(self, key, child=None):
+        if child is None and isinstance(key, str) and "|" in key and not key.startswith("|"):
+            child = self.children.get(key.split("|", 1)[0]) or {"type": "child"}
+        if child is None:
+            return {"target_type": "page"}
+        return {"target_type": child.get("type") or "child", "target_id": child.get("target_id"),
+                "target_url": self._u(child.get("url"))}
+
+    def _redact_text(self, text):
+        """Redact secret-looking JSON fields in a WS/SSE text payload (also Socket.IO '42[...]').
+        Returns (text, changed). With --keep-secrets the text is returned as is."""
+        if self.args.keep_secrets or not text or redact_obj is None:
+            return text, False
+        try:
+            m = re.match(r"^(\d{0,4})([\[{].*)$", text, re.S)
+            if not m:
+                return text, False
+            obj = json.loads(m.group(2))
+            red = redact_obj(obj)
+            if red == obj:
+                return text, False
+            return m.group(1) + json.dumps(red, ensure_ascii=False), True
+        except Exception:
+            return text, False
+
+    def _ws_sse_file(self):
+        if self.ws_sse_out is None:
+            self.ws_sse_out = open(self.run_dir / "ws_sse.jsonl", "a", encoding="utf-8")
+        return self.ws_sse_out
+
+    def _ws_sse_write(self, obj):
+        try:
+            f = self._ws_sse_file()
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            f.flush()
+        except Exception as e:
+            log("WARN escritura ws_sse.jsonl:", e)
+
+    # ---- websocket
+    def _wsx_get(self, key, url=None):
+        c = self.wsx.get(key)
+        if c is None:
+            now = self._wall()
+            c = self.wsx[key] = {
+                "kind": "websocket", "request_id": key, "url": url, "page": self.current_page,
+                **self._target_of(key), "created_ts": now, "created_iso": self._iso(now),
+                "closed_ts": None, "closed_iso": None, "state": "open", "handshake": None,
+                "frames": [], "frames_sent": 0, "frames_received": 0, "frames_dropped": 0,
+                "bytes_sent": 0, "bytes_received": 0, "errors": [], "initiator": None,
+            }
+            if "|" not in str(key):
+                self._wsx_main_seen.add(str(key))
+        elif url and not c.get("url"):
+            c["url"] = url
+        return c
+
+    def _wsx_created(self, p):
+        try:
+            c = self._wsx_get(p.get("requestId"), p.get("url"))
+            init = p.get("initiator") or {}
+            c["initiator"] = {"type": init.get("type"), "url": self._u(init.get("url"))}
+        except Exception as e:
+            log("WARN webSocketCreated:", e)
+
+    def _wsx_hs_request(self, p):
+        try:
+            self._learn_offset(p.get("wallTime"), p.get("timestamp"))
+            c = self._wsx_get(p.get("requestId"))
+            hs = c["handshake"] = c.get("handshake") or {}
+            hs["request_headers"] = lower_headers((p.get("request") or {}).get("headers"))
+            if p.get("wallTime"):
+                c["created_ts"] = round(float(p["wallTime"]), 3)
+                c["created_iso"] = self._iso(c["created_ts"])
+        except Exception as e:
+            log("WARN webSocketWillSendHandshakeRequest:", e)
+
+    def _wsx_hs_response(self, p):
+        try:
+            c = self._wsx_get(p.get("requestId"))
+            r = p.get("response") or {}
+            hs = c["handshake"] = c.get("handshake") or {}
+            hs["status"] = r.get("status")
+            hs["status_text"] = r.get("statusText")
+            hs["response_headers"] = lower_headers(r.get("headers"))
+            if r.get("requestHeaders") and not hs.get("request_headers"):
+                hs["request_headers"] = lower_headers(r.get("requestHeaders"))
+        except Exception as e:
+            log("WARN webSocketHandshakeResponseReceived:", e)
+
+    def _wsx_frame(self, p, direction):
+        try:
+            c = self._wsx_get(p.get("requestId"))
+            resp = p.get("response") or {}
+            op = resp.get("opcode")
+            payload = resp.get("payloadData") or ""
+            is_text = op == 1
+            if is_text:
+                size = len(payload.encode("utf-8", "replace"))
+            else:
+                size = max(0, len(payload) * 3 // 4 - payload[-2:].count("="))
+            c["frames_" + direction] += 1
+            c["bytes_" + direction] += size
+            if len(c["frames"]) >= self.args.max_ws_frames > 0:
+                c["frames_dropped"] += 1
+                return
+            changed = False
+            if is_text:
+                payload, changed = self._redact_text(payload)
+            cap = self.args.max_ws_payload
+            truncated = cap >= 0 and len(payload) > cap
+            if truncated:
+                payload = payload[:cap] if is_text else payload[: cap - cap % 4]
+            fr = {"dir": direction, "opcode": op, "type": self._WS_OPCODES.get(op, "other"),
+                  "encoding": "text" if is_text else "base64", "payload": payload, "payload_len": size,
+                  "truncated": truncated}
+            if changed:
+                fr["redacted"] = True
+            ts = self._wall(p.get("timestamp"))
+            fr["ts"] = ts
+            fr["time"] = self._iso(ts)
+            c["frames"].append(fr)
+        except Exception as e:
+            log("WARN frame WebSocket:", e)
+
+    def _wsx_error(self, p):
+        try:
+            c = self._wsx_get(p.get("requestId"))
+            if len(c["errors"]) < 50:
+                ts = self._wall(p.get("timestamp"))
+                c["errors"].append({"message": str(p.get("errorMessage"))[:300], "ts": ts, "time": self._iso(ts)})
+        except Exception as e:
+            log("WARN webSocketFrameError:", e)
+
+    def _wsx_closed(self, p):
+        try:
+            key = p.get("requestId")
+            c = self._wsx_get(key)
+            ts = self._wall(p.get("timestamp"))
+            c["closed_ts"] = ts
+            c["closed_iso"] = self._iso(ts)
+            c["state"] = "closed"
+            self._wsx_emit(key)
+        except Exception as e:
+            log("WARN webSocketClosed:", e)
+
+    def _wsx_emit(self, key):
+        c = self.wsx.pop(key, None)
+        if c is None:
+            return
+        try:
+            skey = str(key)
+            if "|" in skey and not skey.startswith("|"):
+                raw = skey.split("|", 1)[1]
+                if raw in self._wsx_main_seen:
+                    # same socket already reported by the page session (e.g. dedicated worker)
+                    self.ws_sse["websocket_duplicates_skipped"] += 1
+                    return
+            st = self.ws_sse
+            st["websocket_connections"] += 1
+            if c.get("target_type") != "page":
+                st["websocket_child_connections"] += 1
+            st["websocket_frames"] += c["frames_sent"] + c["frames_received"]
+            st["websocket_frames_sent"] += c["frames_sent"]
+            st["websocket_frames_received"] += c["frames_received"]
+            st["websocket_frames_dropped"] += c["frames_dropped"]
+            out = dict(c)
+            out["frames_total"] = c["frames_sent"] + c["frames_received"]
+            if not out.get("url"):
+                # webSocketCreated was missed (socket opened before Network.enable on a child target):
+                # rebuild scheme://host from the handshake so the connection is still identifiable
+                try:
+                    rh = (c.get("handshake") or {}).get("request_headers") or {}
+                    host = rh.get("host") or rh.get(":authority")
+                    if host:
+                        sch = "wss" if str(rh.get("origin") or "").startswith("https") else "ws"
+                        out["url_partial"] = f"{sch}://{host}/"
+                    out["notes"] = ["URL no disponible: el socket se abrió antes de habilitar la captura en el "
+                                    "target hijo; url_partial se reconstruye desde el handshake"]
+                except Exception:
+                    pass
+            if not self.args.keep_secrets:
+                out["url"] = redact_url(out.get("url") or "") or None
+                hs = out.get("handshake")
+                if hs:
+                    hs = dict(hs)
+                    for k in ("request_headers", "response_headers"):
+                        if k in hs:
+                            hs[k] = redact_headers(hs[k])
+                    out["handshake"] = hs
+            out["redacted"] = not self.args.keep_secrets
+            self._ws_sse_write(out)
+        except Exception as e:
+            log("WARN escribir conexión WebSocket:", e)
+
+    # ---- SSE (text/event-stream)
+    def _ssex_response(self, p, child=None):
+        try:
+            key = p.get("requestId")
+            r = p.get("response") or {}
+            rh = lower_headers(r.get("headers"))
+            ct = (r.get("mimeType") or "") + " " + str(rh.get("content-type") or "")
+            if "event-stream" not in ct.lower() or key in self.ssex:
+                return
+            rec = self.records.get(key) or {}
+            self._learn_offset(rec.get("wall_time"), rec.get("_ts"))
+            now = round(float(rec["wall_time"]), 3) if rec.get("wall_time") else self._wall()
+            rtype = p.get("type") or rec.get("resource_type") or "Other"
+            s = self.ssex[key] = {
+                "kind": "sse", "request_id": key, "url": r.get("url") or rec.get("url"),
+                "method": rec.get("method") or "GET", "page": rec.get("page", self.current_page),
+                **self._target_of(key, child), "resource_type": rtype, "status": r.get("status"),
+                "status_text": r.get("statusText"), "mime_type": r.get("mimeType"),
+                "request_headers": dict(rec.get("request_headers") or lower_headers(r.get("requestHeaders"))),
+                "response_headers": rh, "started_ts": now, "started_iso": self._iso(now),
+                "ended_ts": None, "ended_iso": None, "state": "open", "source": None,
+                "events": [], "events_total": 0, "events_dropped": 0, "bytes": 0, "notes": [],
+            }
+            if rtype == "EventSource":
+                s["source"] = "eventsource"   # Network.eventSourceMessageReceived delivers parsed events
+            else:
+                self._spawn(self._ssex_start_stream(key))
+        except Exception as e:
+            log("WARN detección SSE:", e)
+
+    async def _ssex_start_stream(self, key):
+        """fetch()/XHR-based SSE: ask Chrome to stream the body (Network.streamResourceContent, recent
+        Chromium). Buffered data comes back now; later chunks arrive as Network.dataReceived.data."""
+        s = self.ssex.get(key)
+        if s is None:
+            return
+        try:
+            r = await self._send_for(key, "Network.streamResourceContent", {"requestId": key})
+            s["source"] = "stream"
+            self._ssex_streaming.add(key)
+            buf = r.get("bufferedData") or ""
+            if buf:
+                self._ssex_feed(key, base64.b64decode(buf).decode("utf-8", "replace"))
+        except Exception as e:
+            s["notes"].append(f"streamResourceContent no disponible: {str(e).splitlines()[0][:120]}; "
+                              "se intentará leer el body al terminar")
+
+    def _ssex_feed(self, key, text, ts=None):
+        s = self.ssex.get(key)
+        if s is None or not text or parse_sse is None:
+            return
+        s["bytes"] += len(text.encode("utf-8", "replace"))
+        evs, left = parse_sse(self._ssex_buf.pop(key, "") + text, max_events=10**9, max_data=10**9)
+        if left:
+            self._ssex_buf[key] = left[-1_000_000:]
+        for ev in evs:
+            self._ssex_add(s, ev, ts)
+
+    def _ssex_add(self, s, ev, ts=None):
+        s["events_total"] += 1
+        if len(s["events"]) >= self.args.max_ws_frames > 0:
+            s["events_dropped"] += 1
+            return
+        data, changed = self._redact_text(ev.get("data") or "")
+        cap = self.args.max_ws_payload
+        cut = cap >= 0 and len(data) > cap
+        out = {"event": ev.get("event") or "message", "data": data[:cap] if cut else data, "id": ev.get("id"),
+               "retry": ev.get("retry")}
+        if cut or ev.get("truncated"):
+            out["truncated"] = True
+        if ev.get("incomplete"):
+            out["incomplete"] = True
+        if changed:
+            out["redacted"] = True
+        t = self._wall(ts)
+        out["ts"] = t
+        out["time"] = self._iso(t)
+        s["events"].append(out)
+
+    def _ssex_es_message(self, p):
+        try:
+            s = self.ssex.get(p.get("requestId"))
+            if s is None:
+                return
+            if s.get("source") != "eventsource":
+                s["source"] = "eventsource"
+                s["notes"] = [n for n in s["notes"] if not n.startswith("streamResourceContent")]
+                self._ssex_streaming.discard(p.get("requestId"))
+            data = p.get("data") or ""
+            ev = {"event": p.get("eventName") or "message", "data": data, "id": p.get("eventId") or None,
+                  "retry": None}
+            s["bytes"] += len(data.encode("utf-8", "replace"))
+            self._ssex_add(s, ev, p.get("timestamp"))
+        except Exception as e:
+            log("WARN evento SSE:", e)
+
+    def _ssex_data(self, p):
+        key = p.get("requestId")
+        if key not in self._ssex_streaming:
+            return
+        try:
+            if p.get("data"):
+                self._ssex_feed(key, base64.b64decode(p["data"]).decode("utf-8", "replace"), p.get("timestamp"))
+        except Exception as e:
+            log("WARN datos SSE:", e)
+
+    def _ssex_finished(self, p):
+        key = p.get("requestId")
+        s = self.ssex.get(key)
+        if s is None:
+            return
+        s["ended_ts"] = self._wall(p.get("timestamp"))
+        s["ended_iso"] = self._iso(s["ended_ts"])
+        s["state"] = "finished"
+        if not s["events"] and s.get("source") != "stream":
+            self._spawn(self._ssex_from_body(key))
+        else:
+            self._ssex_emit(key)
+
+    def _ssex_failed(self, p):
+        key = p.get("requestId")
+        s = self.ssex.get(key)
+        if s is None:
+            return
+        s["ended_ts"] = self._wall(p.get("timestamp"))
+        s["ended_iso"] = self._iso(s["ended_ts"])
+        s["state"] = "closed" if p.get("canceled") else "failed"
+        if p.get("errorText") and not p.get("canceled"):
+            s["error_text"] = p.get("errorText")
+        self._ssex_emit(key)
+
+    async def _ssex_from_body(self, key):
+        s = self.ssex.get(key)
+        try:
+            if s is not None:
+                r = await self._send_for(key, "Network.getResponseBody", {"requestId": key})
+                body = r.get("body") or ""
+                text = base64.b64decode(body).decode("utf-8", "replace") if r.get("base64Encoded") else body
+                s["source"] = s.get("source") or "body"
+                self._ssex_feed(key, text + ("\n\n" if text and not text.endswith("\n\n") else ""))
+        except Exception as e:
+            if s is not None:
+                s["notes"].append(f"body del stream no disponible: {str(e).splitlines()[0][:120]}")
+        finally:
+            self._ssex_emit(key)
+
+    def _ssex_emit(self, key):
+        s = self.ssex.pop(key, None)
+        self._ssex_streaming.discard(key)
+        left = self._ssex_buf.pop(key, "")
+        if s is None:
+            return
+        try:
+            if left.strip() and parse_sse is not None:
+                evs, _ = parse_sse(left + "\n\n", max_data=10**9)
+                for ev in evs:
+                    ev["incomplete"] = True
+                    self._ssex_add(s, ev)
+            if not s.get("source"):
+                s["source"] = "headers_only"
+                s["notes"].append("solo se detectó el endpoint SSE (URL y headers); los eventos no estaban disponibles")
+            self.ws_sse["sse_streams"] += 1
+            self.ws_sse["sse_events"] += s["events_total"]
+            srcs = self.ws_sse["sse_sources"]
+            srcs[s["source"]] = srcs.get(s["source"], 0) + 1
+            out = dict(s)
+            if not out["notes"]:
+                out.pop("notes")
+            if not self.args.keep_secrets:
+                out["url"] = redact_url(out.get("url") or "") or None
+                out["request_headers"] = redact_headers(out.get("request_headers"))
+                out["response_headers"] = redact_headers(out.get("response_headers"))
+            out["redacted"] = not self.args.keep_secrets
+            self._ws_sse_write(out)
+        except Exception as e:
+            log("WARN escribir stream SSE:", e)
+
+    def _ws_sse_finalize(self):
+        """Write connections/streams still open at the end of the run (state stays 'open')."""
+        try:
+            for key in list(self.wsx):
+                self._wsx_emit(key)
+            for key in list(self.ssex):
+                self._ssex_emit(key)
+        except Exception as e:
+            log("WARN cierre de captura WS/SSE:", e)
+        try:
+            if self.ws_sse_out:
+                self.ws_sse_out.close()
+                self.ws_sse_out = None
+        except Exception:
+            pass
 
     # -------- flushing
     async def drain(self, timeout=30):
@@ -596,6 +1094,7 @@ class Capture:
         return False
 
     def close(self):
+        self._ws_sse_finalize()
         self.req_out.close()
         if self.ws_out:
             self.ws_out.close()
@@ -631,6 +1130,8 @@ def capabilities_info(cap=None) -> dict:
         "auto_attach_mode": aa.get("mode"),
         "body_decoding": ["gzip", "deflate"] + (["br"] if has("brotli") else []) + (["zstd"] if has("zstandard") else []),
         "body_kind_detection": ["json", "grpc", "protobuf"],
+        "ws_sse_capture": bool(getattr(cap, "ws_enabled", False)) if cap is not None else True,
+        "session_cache": load_session is not None,
         "analysis": ["graphql_persisted_queries", "auth_flow", "endpoint_roles", "pagination_confirmation",
                      "rate_limit", "anti_bot", "openapi_export"],
     }
@@ -826,6 +1327,143 @@ def redact_har(path: Path):
     path.write_text(json.dumps(har, ensure_ascii=False), encoding="utf-8")
 
 
+# ============================================================ session cache (login / captcha reuse)
+
+_CHALLENGE_STATUSES = (401, 403, 407, 429, 503)
+
+
+def _fmt_age(sec) -> str:
+    try:
+        sec = int(sec or 0)
+        d, rem = divmod(sec, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s_ = divmod(rem, 60)
+        return f"{d}d {h}h" if d else (f"{h}h {m:02d}m" if h else f"{m}m {s_:02d}s")
+    except Exception:
+        return "?"
+
+
+def _state_fingerprint(st) -> str:
+    """Hash (never the values themselves) of cookies + localStorage, to detect a changed session."""
+    import hashlib
+    try:
+        ck = sorted((c.get("name"), c.get("value"), c.get("domain"), c.get("path")) for c in (st or {}).get("cookies") or [])
+        ls = sorted((o.get("origin"), i.get("name"), i.get("value")) for o in (st or {}).get("origins") or []
+                    for i in o.get("localStorage") or [])
+        return hashlib.sha256(json.dumps([ck, ls], default=str).encode()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _session_prepare(start, args, ctx_kw, sess):
+    """--session-cache: load a valid cached storage_state into the new context. Never raises."""
+    try:
+        if load_session is None:
+            sess["status"] = "unavailable"
+            return
+        dom = session_domain(start)
+        sess.update(domain=dom, ttl_s=session_ttl())
+        if args.storage_state:
+            sess.update(status="skipped", note="--storage-state explícito tiene prioridad sobre la caché")
+            log("caché de sesión: se usa el --storage-state explícito; la caché no se carga (se actualizará al final)")
+            return
+        info = load_session(dom)
+        sess["status"] = info.get("status")
+        sess["path"] = info.get("path")
+        for k in ("age_s", "saved_iso", "expired_cookies_dropped", "error"):
+            if k in info:
+                sess[k] = info[k]
+        if info.get("status") == "hit":
+            ctx_kw["storage_state"] = info["storage_state"]
+            summ = info.get("summary") or {}
+            sess["loaded"] = True
+            sess["loaded_summary"] = summ
+            sess["_loaded_fp"] = _state_fingerprint(info["storage_state"])
+            log(f"caché de sesión: HIT para {dom} (edad {_fmt_age(info.get('age_s'))}, {summ.get('cookies', 0)} cookies, "
+                f"{summ.get('local_storage_keys', 0)} claves localStorage) <- {info.get('path')}")
+        else:
+            why = {"miss": "no hay sesión guardada",
+                   "expired": f"sesión expirada (edad {_fmt_age(info.get('age_s'))}, TTL {_fmt_age(info.get('ttl_s'))})",
+                   "corrupt": "archivo de caché ilegible, se ignora",
+                   "empty": "la sesión guardada no tiene cookies vigentes"}.get(info.get("status"), info.get("status"))
+            log(f"caché de sesión: {str(info.get('status')).upper()} para {dom} ({why}); se inicia sin sesión")
+    except Exception as e:
+        sess.update(status="error", error=str(e)[:200])
+        log("WARN caché de sesión (carga):", e)
+
+
+async def _human_pause(page, args, info, sess):
+    """--human-pause: let a human solve login/captcha on the first page before crawling on."""
+    try:
+        if sess.get("loaded") and info.get("status") not in _CHALLENGE_STATUSES:
+            sess["human_pause"] = "omitida: sesión válida cargada desde la caché"
+            log("pausa humana omitida: se cargó una sesión válida desde la caché")
+            return
+        if not args.headed:
+            log("AVISO: --human-pause sin --headed; no hay ventana visible para resolver login/captcha")
+        secs = args.human_pause or 0
+        if secs > 0:
+            log(f"pausa humana: resuelve el login/captcha en el navegador; se continúa en {secs:g} s...")
+            await page.wait_for_timeout(secs * 1000)
+        elif sys.stdin is not None and sys.stdin.isatty():
+            log("pausa humana: resuelve el login/captcha en la ventana del navegador y presiona Enter aquí para continuar...")
+            await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
+        else:
+            log("pausa humana: stdin no es interactivo; se esperan 60 s")
+            await page.wait_for_timeout(60000)
+        await wait_idle(page, args.idle_timeout)
+        sess["human_step"] = True
+        sess["human_pause"] = "completada"
+        info["human_pause"] = True
+    except Exception as e:
+        log("WARN pausa humana:", e)
+
+
+async def _session_finish(context, start, args, pages, sess):
+    """--session-cache: save the resolved session at the end of the run when it is worth it. Never raises."""
+    try:
+        if save_session is None:
+            return
+        st = await context.storage_state()
+        summ = session_summary(st)
+        sess["final_summary"] = {k: summ.get(k) for k in ("cookies", "origins", "local_storage_keys")}
+        last = next((p for p in reversed(pages) if not p.get("skipped")), None)
+        last_status = (last or {}).get("status")
+        reason = skip = None
+        if not summ.get("cookies") and not summ.get("local_storage_keys"):
+            skip = "no hay cookies ni localStorage que guardar"
+        elif sess.get("human_step"):
+            reason = "login/captcha resuelto por el humano (--human-pause)"
+        elif last is None or last_status in _CHALLENGE_STATUSES:
+            skip = f"la última página respondió {last_status}: parece un login/desafío sin resolver"
+            if sess.get("loaded"):
+                sess["note"] = "la sesión en caché podría estar vencida en el servidor (usa --human-pause para renovarla)"
+        elif sess.get("loaded") and _state_fingerprint(st) == sess.get("_loaded_fp"):
+            skip = "la sesión no cambió; se conserva la marca de tiempo original"
+        elif sess.get("loaded"):
+            reason = "sesión renovada (cookies/localStorage actualizados en esta corrida)"
+        elif args.storage_state:
+            reason = "importada desde --storage-state"
+        else:
+            reason = "sesión nueva obtenida en esta corrida"
+        if skip:
+            sess.update(saved=False, save_skipped=skip)
+            log(f"caché de sesión: no se guarda ({skip})")
+            return
+        r = save_session(sess.get("domain") or session_domain(start), st,
+                         extra={"start_url": redact_url(start), "reason": reason,
+                                "human_step": bool(sess.get("human_step")), "saved_by": "mapper.py"})
+        if r.get("ok"):
+            sess.update(saved=True, save_reason=reason, path=r.get("path"), saved_iso=r.get("saved_iso"))
+            log(f"caché de sesión: guardada ({reason}; {summ.get('cookies', 0)} cookies) -> {r.get('path')}")
+        else:
+            sess.update(saved=False, save_error=r.get("error"))
+            log("WARN caché de sesión: no se pudo guardar:", r.get("error"))
+    except Exception as e:
+        sess.update(saved=False, save_error=str(e)[:200])
+        log("WARN caché de sesión (guardado):", e)
+
+
 async def crawl(args):
     start = norm_link(args.url)
     if not start:
@@ -859,6 +1497,7 @@ async def crawl(args):
     meta = {"tool": "web-network-mapper", "start_url": start, "started_at": now_iso(),
             "args": {k: v for k, v in vars(args).items() if not k.startswith("_")}}
     t_start = time.monotonic()
+    sess = {"enabled": bool(getattr(args, "session_cache", False))}
 
     async with async_playwright() as pw:
         launch_kw = {"headless": not args.headed}
@@ -881,7 +1520,18 @@ async def crawl(args):
         extra = parse_header_args(args.header)
         if extra:
             ctx_kw["extra_http_headers"] = extra
-        context = await browser.new_context(**ctx_kw)
+        if sess["enabled"]:
+            _session_prepare(start, args, ctx_kw, sess)
+        try:
+            context = await browser.new_context(**ctx_kw)
+        except Exception as e:
+            if not sess.get("loaded"):
+                raise
+            log("WARN caché de sesión: Playwright rechazó el storage_state guardado; se continúa sin sesión:",
+                str(e).splitlines()[0][:200])
+            ctx_kw.pop("storage_state", None)
+            sess.update(status="invalid", loaded=False, error=str(e).splitlines()[0][:200])
+            context = await browser.new_context(**ctx_kw)
         if args.cookies:
             cks = load_cookies_file(args.cookies)
             await context.add_cookies(cks)
@@ -951,6 +1601,8 @@ async def crawl(args):
                         await cap.attach(page)
                 if "error" not in info or not page.is_closed():
                     await wait_idle(page, args.idle_timeout)
+                    if visited == 1 and getattr(args, "human_pause", None) is not None:
+                        await _human_pause(page, args, info, sess)
                     if args.wait:
                         await page.wait_for_timeout(args.wait)
                     errors: list[str] = []
@@ -1004,6 +1656,8 @@ async def crawl(args):
         finally:
             await cap.drain(10)
             cap.current_page = None
+            if sess["enabled"]:
+                await _session_finish(context, start, args, pages, sess)
             if args.save_storage_state:
                 try:
                     await context.storage_state(path=args.save_storage_state)
@@ -1034,6 +1688,11 @@ async def crawl(args):
         meta["capabilities"] = capabilities_info(cap)
     except Exception as e:
         meta["capabilities_error"] = str(e)[:200]
+    try:
+        meta["ws_sse"] = cap.ws_sse
+        meta["session_cache"] = {k: v for k, v in sess.items() if not k.startswith("_")}
+    except Exception as e:
+        meta["ws_sse_error"] = str(e)[:200]
     (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     log("building api map...")
     summary = analyze.build(run_dir, include_documents=args.map_documents, emit_curl=args.emit_curl,
@@ -1089,6 +1748,14 @@ def build_parser():
     g.add_argument("--browser-channel", help="use installed browser channel, e.g. chrome (default: bundled chromium)")
     g.add_argument("--no-auto-attach", dest="auto_attach", action="store_false", default=True,
                    help="do not auto-attach to iframes/workers/service workers (capture main page session only)")
+    g.add_argument("--session-cache", dest="session_cache", action="store_true", default=False,
+                   help="reutilizar/guardar la sesión resuelta (cookies + storage_state) por dominio en "
+                        "~/.cache/wnm/sessions/ (TTL: env WNM_SESSION_TTL, 24h por defecto)")
+    g.add_argument("--no-session-cache", dest="session_cache", action="store_false",
+                   help="no usar la caché de sesión (comportamiento por defecto)")
+    g.add_argument("--human-pause", type=float, nargs="?", const=0, default=None, metavar="SECONDS",
+                   help="tras cargar la primera página, pausar para que un humano resuelva login/captcha "
+                        "(solo el flag = esperar Enter; N = esperar N s). Se omite si hubo HIT de caché")
     g = ap.add_argument_group("capture / output")
     g.add_argument("--out-root", default=str(TOOL_DIR / "runs"), help="parent dir for run folders")
     g.add_argument("--out", help="exact output dir (overrides --out-root naming)")
@@ -1097,6 +1764,10 @@ def build_parser():
     g.add_argument("--all-bodies", action="store_true", help="save bodies of every response (scripts, css, images ...)")
     g.add_argument("--no-bodies", action="store_true", help="do not save any response bodies")
     g.add_argument("--max-ws-payload", type=int, default=65536, help="cap per WebSocket/SSE message stored")
+    g.add_argument("--max-ws-frames", type=int, default=5000,
+                   help="máximo de frames WebSocket / eventos SSE guardados por conexión en ws_sse.jsonl (0 = sin límite)")
+    g.add_argument("--no-ws", action="store_true",
+                   help="no capturar WebSocket ni SSE (ni ws_sse.jsonl ni websockets.jsonl)")
     g.add_argument("--har-content", choices=["embed", "omit"], default="embed", help="HAR response content mode")
     g.add_argument("--no-har", action="store_true", help="skip HAR recording")
     g.add_argument("--map-documents", action="store_true", help="also list HTML document requests in api_map")

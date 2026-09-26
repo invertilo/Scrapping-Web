@@ -52,4 +52,6 @@ else
   echo "[setup] chromium OK"
 fi
 chmod +x "$HERE"/*.sh "$HERE"/*.py 2>/dev/null || true
+# wrapper launchers have no extension; make them executable too
+for w in wnm wnm-map wnm-analyze wnm-replay wnm-recon wnm-login wnm-watch wnm-scan; do chmod +x "$HERE/$w" 2>/dev/null || true; done
 echo "[setup] done. Run: $HERE/.venv/bin/python $HERE/mapper.py --help"

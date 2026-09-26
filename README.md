@@ -28,24 +28,24 @@
   Mapea un sitio leyendo el mismo tráfico que muestra la pestaña <strong>Network</strong> de DevTools.
 </p>
 
-Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP). Con esa captura arma el mapa de páginas, el mapa de APIs, el flujo de inicio a fin y un curl por paso. Después puede repetir esas APIs con paginación y exportar JSON o CSV.
+Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP). Con esa captura arma el mapa de páginas, el mapa de APIs, el flujo de inicio a fin y un curl por paso. Después puede repetir esas APIs, vigilar si cambian y, en un objetivo autorizado, probar la seguridad de los endpoints.
 
 El uso es en páginas y APIs para las que tienes permiso: un pentest, una auditoría o un sitio propio. Los dominios `.gob`, `.gov` y `.mil` (y variantes como `gob.bo` o `gov.co`) se rechazan solos. Con autorización explícita para ese sitio, antepón `WNM_ALLOW_RESTRICTED=1`.
 
 ## La skill
 
-`SKILL.md` es la guía que usa un agente para correr la herramienta de principio a fin en un sitio autorizado. Ahora no se queda en “captura y saca curls”: clasifica los endpoints, sigue el token de un paso al siguiente, marca la protección anti-bot y deja un OpenAPI para repetir el trabajo.
+`SKILL.md` guía al agente para correr la herramienta de principio a fin. Esta ronda deja de ser solo captura y curl: un solo comando encadena el mapa, el análisis exporta esquema, Postman y un HTML offline, el replay aguanta rate limit, el recon confirma el origen con el certificado TLS, y `wnm-scan` revisa la seguridad de los endpoints.
 
 | Con la skill | Sin la skill |
 |---|---|
-| Captura también iframes, workers y service workers, y decodifica gzip, deflate, brotli y zstd. | Esas llamadas quedan fuera de `requests.jsonl` y los cuerpos comprimidos no se leen. |
-| Arma el flujo completo y encadena en `flow.sh` cookies, JWT, CSRF y JSF ViewState. | Hay que copiar cada token a mano entre un paso y el siguiente. |
-| Marca cada endpoint como `SEARCH`, `LIST` o `DETAIL`, confirma el paginador y avisa del rate limit. | La paginación se adivina y un `429` se ve tarde. |
-| Detecta Cloudflare, hCaptcha, reCAPTCHA, Akamai, PerimeterX, DataDome, Imperva y captcha propio, y sugiere una estrategia. | La protección se descubre cuando la request ya falló. |
-| Exporta `openapi.json` y un resumen `--json` para automatizar el pentest. | El mapa queda solo en un markdown que hay que releer. |
-| En el recon, junta IP histórica, favicon, DNS de infraestructura y un veredicto `SI` / `POSIBLE` / `NO`. | Cada fuente se consulta por separado y el origen queda en una nota. |
+| `wnm all` captura, analiza y puede enganchar recon y watch. La última línea es la carpeta del run. | Cada paso se lanza a mano y el resultado queda repartido. |
+| Guarda la sesión resuelta por dominio, fuera del zip, y captura WebSocket y SSE. | El captcha se repite en cada corrida y los sockets no entran al mapa. |
+| Infiere JSON Schema, detecta el parámetro que lleva el dato y genera `replay.sh` con la paginación cableada. | El campo útil y la paginación se adivinan en cada endpoint. |
+| `wnm-watch` compara la superficie de APIs y marca lo agregado, quitado o cambiado. | El diff entre dos capturas se hace a ojo. |
+| `wnm-scan` revisa secretos, JWT y headers sin mandar requests. Las pruebas activas solo arrancan con `--authorized`. | Auth rota, IDOR o CORS se prueban a mano, o se disparan sin un tope. |
+| El recon suma VirusTotal, urlscan y Netlas, y compara el certificado TLS contra el edge. | Una IP histórica se queda como pista, sin saber si el certificado es el del sitio. |
 
-La detección anti-bot identifica y aconseja. No evade la protección. Una IP histórica es una pista: el veredicto se queda en `POSIBLE` hasta que el origen se verifica. Las API keys van en variables de entorno.
+La detección anti-bot identifica y aconseja. No evade la protección. Las pruebas activas de `wnm-scan` comparan contra la respuesta buena ya capturada: sondeo por señales, sin exploits. Una IP histórica sigue en `POSIBLE` hasta verificarla. Las API keys van en variables de entorno.
 
 ## Contenido
 
@@ -53,10 +53,13 @@ La detección anti-bot identifica y aconseja. No evade la protección. Una IP hi
 - [Instalación](#instalación)
 - [Uso rápido](#uso-rápido)
 - [Piezas](#piezas)
-- [Mapeo y análisis](#mapeo-y-análisis)
+- [Sesión, WebSocket y SSE](#sesión-websocket-y-sse)
+- [Análisis](#análisis)
+- [Replay](#replay)
+- [Watch](#watch)
 - [Recon](#recon)
+- [Seguridad](#seguridad)
 - [Archivos de cada corrida](#archivos-de-cada-corrida)
-- [Captcha](#captcha)
 - [Límites](#límites)
 
 ## Instalación
@@ -67,126 +70,169 @@ cd Scrapping-Web
 ./setup.sh
 ```
 
-`setup.sh` crea el entorno virtual e instala Playwright, Chromium y las dependencias de decodificación y favicon.
-
 | Paquete | Para qué |
 |---|---|
 | `playwright>=1.47` | Chromium y CDP |
-| `httpx>=0.27` | Replay de endpoints |
+| `httpx>=0.27` | Replay y pruebas activas |
 | `brotli>=1.1` | Cuerpos brotli |
 | `zstandard>=0.22` | Cuerpos zstd |
 | `mmh3>=4.0` | Hash de favicon estilo Shodan |
+| `protobuf>=5.26` | Decodificar protobuf con `--descriptor` |
+| `grpcio-tools>=1.62` | Compilar `.proto` para `--proto` |
+
+Si faltan `protobuf` o `grpcio-tools`, el análisis sigue y lo avisa. `--descriptor` solo necesita `protobuf`.
 
 ## Uso rápido
 
 ```bash
-RUN=$(./wnm-map https://ejemplo.com/ --depth 1 --max-pages 20 | tail -1)
-bash $RUN/flow.sh
-./wnm-replay $RUN --list
-./wnm-replay $RUN/api_map.json 1 --paginate page --max-pages 0 --format both
-./wnm-recon ejemplo.com
+RUN=$(./wnm all https://ejemplo.com/ --depth 1 --max-pages 20 | tail -1)
+./wnm-scan "$RUN"
+./wnm-scan "$RUN" --authorized
+./wnm watch "$RUN"
 ```
 
-| Flag | Para qué |
+`wnm all` encadena map y analyze. `--recon` y `--watch` son opcionales. La última línea impresa es la carpeta del run.
+
+| Flag de captura | Para qué |
 |---|---|
 | `--scroll` | Scroll infinito y carga perezosa. |
-| `--actions archivo.json` | Clics y escritura que disparan requests. Ver `examples/`. |
+| `--actions archivo.json` | Clics y escritura. Ver `examples/`. |
 | `--headed` | Muestra el navegador para un formulario o un captcha. |
+| `--session-cache` | Reutiliza cookies y storage-state del dominio. |
+| `--human-pause` | Pausa para resolver login o captcha a mano. |
+| `--no-auto-attach` | Solo la página principal, sin iframes ni workers. |
+| `--no-ws` | No captura WebSocket ni SSE. |
 | `--emit-curl api` | Vuelca las requests como curl en `curls.sh`. |
-| `--no-auto-attach` | Captura solo la página principal, sin iframes ni workers. |
-| `--keep-secrets` | Guarda cookies y tokens reales para confirmar el flujo de auth. |
-
-Para un sitio con login: `./wnm-login https://ejemplo.com/login --out estado.json` y luego `--storage-state estado.json`.
 
 ## Piezas
 
 | Comando | Módulo | Qué hace |
 |---|---|---|
+| `wnm` | `cli.py` | Entrada única: `map`, `analyze`, `replay`, `recon`, `watch`, `login` y `all`. |
 | `wnm-map` | `mapper.py` | Recorre el sitio y captura el tráfico. |
-| `wnm-analyze` | `analyze.py` | Agrupa endpoints, arma el flujo, los curl y el OpenAPI. |
-| `wnm-replay` | `replay.py` | Repite un endpoint con paginación y guarda JSON/CSV. |
+| `wnm-analyze` | `analyze.py` | Endpoints, flujo, esquema, Postman, HTML y `replay.sh`. |
+| `wnm-replay` | `replay.py` | Repite un endpoint con paginación, reintentos y rate limit. |
 | `wnm-recon` | `recon.py` | Recon del dominio y veredicto de origen. |
-| `wnm-login` | `login.py` | Abre el navegador, guarda la sesión. |
-| | `wnm_common.py` | Oculta secretos, bloquea dominios restringidos y detecta anti-bot. |
-| | `wnm_curl.py` | Arma los curl, también con cuerpo binario. |
+| `wnm-watch` | `watch.py` | Snapshot y diff de la superficie de APIs. |
+| `wnm-scan` | `security.py` | Revisión de seguridad. Lo activo exige `--authorized`. |
+| `wnm-login` | `login.py` | Abre el navegador y guarda la sesión. |
 
-## Mapeo y análisis
+Alias: `wnm mapper`, `wnm analyse`, `wnm diff`.
 
-### Cuerpos, gRPC y GraphQL
+## Sesión, WebSocket y SSE
 
-Los cuerpos **gzip, deflate, brotli y zstd** se decodifican solos, por `content-encoding` o por magic bytes. **gRPC / protobuf** se marcan `GRPC` / `PROTOBUF` y no se decodifican. Las **GraphQL persisted queries** salen como `PERSISTED_QUERY`, con `hash`, `version` y `operationName`. Los curl de cuerpo binario usan `--data-binary`.
+`--session-cache` guarda cookies y storage-state por dominio en `~/.cache/wnm/sessions/`, fuera de la herramienta, para que no entren al zip. El TTL sale de `WNM_SESSION_TTL` (por defecto `24h`). El directorio se cambia con `WNM_SESSION_CACHE_DIR`. Viene apagado.
 
-### Iframes, workers y service workers
+`ws_sse.jsonl` guarda frames de WebSocket y eventos SSE, también dentro de iframes y workers. Los secretos se redactan salvo `--keep-secrets`. Tope por defecto: `--max-ws-frames 5000`.
 
-`wnm-map` se engancha a los targets hijos con CDP `Target.setAutoAttach`. Cada request hija lleva `target_type` (`page`, `iframe`, `worker`, `service_worker`), `target_id`, `target_url` y `frame_id`. `run_meta.json` guarda `auto_attach` y `capabilities`. `--no-auto-attach` vuelve a la sesión de la página principal.
+## Análisis
 
-### Auth y tokens
+Sigue decodificando gzip, deflate, brotli y zstd, marcando GraphQL persisted queries, agrupando roles `SEARCH` / `LIST` / `DETAIL`, confirmando el paginador y encadenando tokens en `flow.sh` (cookies, JWT, CSRF, JSF ViewState).
 
-`api_map.json` trae `auth_flow` y `api_map.md` la sección **Autenticación / tokens**: qué request emite cada token, quién lo usa y por dónde viaja (cookies, JWT, headers, CSRF, JSF ViewState). `flow.sh` lo encadena con `wnm_json`, `wnm_hidden` y `wnm_urlenc`. Con `--keep-secrets` esa relación se confirma con los valores reales. Sin ese flag, se infiere.
+Esta ronda suma:
 
-### Rol, paginación y rate limit
+| Salida | Qué es |
+|---|---|
+| `schemas/` y `schemas.json` | JSON Schema draft 2020-12 por endpoint. `--no-json-schema` lo omite. |
+| `data_param` | El campo que lleva el dato de la consulta, aparte de paginación, captcha y ViewState. |
+| `replay.sh` | Llama a `wnm-replay` con la paginación ya cableada. `./replay.sh N` corre el endpoint N. |
+| `openapi.json` | OpenAPI 3.0.3. `--no-openapi` lo omite. |
+| `postman_collection.json` | Colección Postman v2.1.0. Secretos como `{{VAR}}`. `--no-postman` lo omite. |
+| `report.html` | Reporte navegable, sin requests externas. `--no-html` lo omite. |
 
-Cada endpoint recibe un `role`: `SEARCH`, `LIST` o `DETAIL` (si no encaja, `ACTION` / `OTHER`). `pagination_confirmed` y `confirmed_paginator` se activan cuando dos llamadas al mismo endpoint cambian un solo parámetro. Un `429` junto con `retry-after` o `x-ratelimit-*` genera `rate_limit`, el flag `RATE_LIMIT` y la sección **Rate limit**.
-
-### Anti-bot
-
-`detect_anti_bot()` reconoce Cloudflare, hCaptcha, reCAPTCHA, Akamai, PerimeterX, DataDome, Imperva, desafíos genéricos 403/503 y captcha propio del servidor. El resultado va en `anti_bot` y en **Protección anti-bot detectada**, con una estrategia sugerida en español. Solo detecta y aconseja.
-
-### OpenAPI y `--json`
-
-Si hay endpoints de primera parte, `wnm-analyze` escribe `openapi.json` (OpenAPI 3.0.3). `--no-openapi` lo omite. `--json` imprime solo el resumen: `openapi_file`, `auth_tokens`, `anti_bot`, `rate_limited_endpoints`, `roles` y las rutas del mapa.
+Protobuf y gRPC se decodifican de verdad con `--proto` o `--descriptor`. Sin esquema, el volcado queda marcado como genérico. Esa decodificación se probó con captura sintética.
 
 ```bash
-./wnm-analyze "$RUN" --json
+./wnm analyze "$RUN" --json
 ```
+
+## Replay
+
+Reintenta con backoff y jitter ante errores de red y respuestas 5xx. Ante `429`, `Retry-After` o `X-RateLimit` espera y baja el ritmo, con tope de 300 s. `--ignore-rate-limit` desactiva esa espera. `--backoff` parte de `0.5` y `--max-backoff` de `60`.
+
+## Watch
+
+```bash
+./wnm watch https://ejemplo.com/
+./wnm watch "$RUN" --json
+```
+
+Compara el snapshot nuevo con el anterior: endpoints y campos agregados, quitados o cambiados, más tokens, anti-bot, rate limit y websockets. Los snapshots viven en `.watch/`.
+
+| Código | Significado |
+|---|---|
+| `0` | Sin cambios, o línea base creada. |
+| `10` | Hay cambios. |
+| `1` | Error o dominio bloqueado. |
+| `2` | Uso incorrecto. |
+
+`--save-only` guarda sin comparar. `--no-save` compara sin avanzar la línea base. `--baseline ARCHIVO` compara contra ese snapshot.
 
 ## Recon
 
 ```bash
-./wnm-recon ejemplo.com
+./wnm recon ejemplo.com
 ```
 
-Subdominios (crt.sh y c99), DNS, Cloudflare y un veredicto de origen. El reporte queda en `runs/recon-<dominio>-<fecha>/report.md`. La última línea de la salida es esa carpeta. `--json` vuelca `recon.json` en stdout.
+A las fuentes anteriores (crt.sh, c99, SecurityTrails, Shodan, Censys, favicon `mmh3`, DNS de correo y `--scan-range`) se suman VirusTotal, urlscan.io y Netlas. Sin key, VirusTotal y Netlas se saltan. urlscan puede consultar en público con cupo reducido.
 
 | Fuente | Variable | Flag |
 |---|---|---|
 | SecurityTrails | `SECURITYTRAILS_API_KEY` | `--securitytrails-key` |
 | Shodan | `SHODAN_API_KEY` | `--shodan-key` |
 | Censys | `CENSYS_API_ID`, `CENSYS_API_SECRET` | `--censys-id`, `--censys-secret` |
+| VirusTotal | `VIRUSTOTAL_API_KEY` | `--virustotal-key` |
+| urlscan.io | `URLSCAN_API_KEY` | `--urlscan-key` |
+| Netlas | `NETLAS_API_KEY` | `--netlas-key` |
 
-Sin key, la fuente se salta y el reporte dice «no configurado».
+La verificación TLS lee CN, SAN, emisor y fingerprint SHA256 y los compara con el edge. Si el certificado coincide, la IP sube a «sirve el sitio» y el veredicto gana confianza. `--json` vuelca `recon.json`. `--scan-range` sigue siendo opt-in, activo y solo para un objetivo autorizado.
 
-También correlaciona el **favicon** (hash `mmh3`, y `http.favicon.hash` si hay key de Shodan) y el hash del cuerpo contra el edge. Resuelve MX, TXT/SPF, `_dmarc` y subdominios que suelen apuntar al hosting real (`mail`, `smtp`, `ftp`, `cpanel`, `webmail`, `direct`, `origin`, `server`).
+## Seguridad
 
-Un candidato cuenta como origen si coinciden el hash del cuerpo o el título, si no responde `server: cloudflare`, y tras probar también los puertos **8080** y **8443**. `--scan-range` recorre el rango alrededor de un origen ya verificado (`--range-prefix` 24, `--range-max` 256). Es activo y lento: solo en un objetivo autorizado.
+`wnm-scan` parte de lo ya capturado. Por defecto no manda ningún request.
 
-El veredicto junta todas las fuentes. La confianza es alta cuando un candidato histórico o de favicon además se verifica. Si la IP solo existe a nivel DNS, el nivel es **POSIBLE**.
+```bash
+./wnm-scan "$RUN"
+./wnm-scan "$RUN" --authorized --max-requests 100
+```
+
+Pasivo: secretos, JWT (`alg:none`, `exp`), scorecard de headers, matriz de auth, superficie GraphQL y auditoría de lo capturado.
+
+Activo, solo con `--authorized`:
+
+- Sin header de auth, con header basura o con token inválido: ¿la respuesta sigue trayendo los mismos datos?
+- Request incompleto: quitar parámetros requeridos uno a uno.
+- IDOR sobre ids vecinos, nunca en hosts restringidos.
+- Sondeo SQLi, XSS y SSTI por señales (error SQL, reflejo, 500). No lanza exploits.
+- CORS, métodos observados y una ráfaga corta de rate limit.
+
+Escribe `security_report.md` y `security_findings.json` con severidad Crítico, Alto, Medio, Bajo e Info. Tope por defecto de 100 requests, espera de `0.5` s, respeta `429` y no inventa métodos destructivos: solo GET, HEAD, OPTIONS o el método ya observado.
 
 ## Archivos de cada corrida
 
 | Archivo | Qué es |
 |---|---|
-| `flow.md` / `flow.sh` | Flujo completo, con curl, pausa de captcha y encadenado de tokens. |
-| `api_map.md` / `api_map.json` | Endpoints, rol, paginación, auth, anti-bot, rate limit y curl. |
-| `openapi.json` | OpenAPI 3.0.3 de los endpoints de primera parte. |
-| `run_meta.json` | Metadatos, con `auto_attach` y `capabilities`. |
-| `curls.sh` | Requests como curl, con `--emit-curl`. |
-| `pages.json` | Páginas, enlaces y APIs por página. |
+| `flow.md` / `flow.sh` | Flujo completo, con curl y encadenado de tokens. |
+| `api_map.md` / `api_map.json` | Endpoints, rol, `data_param`, auth, anti-bot y curl. |
+| `schemas/` / `schemas.json` | JSON Schema por endpoint. |
+| `openapi.json` | OpenAPI 3.0.3. |
+| `postman_collection.json` | Colección Postman v2.1.0. |
+| `report.html` | Reporte offline. |
+| `replay.sh` | Extracción con paginación cableada. |
+| `ws_sse.jsonl` | Frames WebSocket y eventos SSE. |
+| `security_report.md` / `security_findings.json` | Hallazgos de `wnm-scan`. |
+| `pages.json` | Páginas, enlaces y APIs. |
 | `network.har` | HAR estándar. |
 | `bodies/` | Cuerpos de respuesta. |
-| `requests.jsonl` | Una línea por request, con el target que la originó. |
+| `requests.jsonl` | Una línea por request. |
 | `extracts/` | JSON y CSV de `wnm-replay`. |
-
-## Captcha
-
-La herramienta detecta el paso, muestra la imagen y espera el texto. Con esa respuesta sigue el flujo. Cada consulta nueva necesita una sesión fresca y un captcha nuevo.
 
 ## Límites
 
 - Los enlaces salen de `<a href>`.
 - Los curl usan un user-agent de HeadlessChrome, que algunos sitios rechazan.
-- Tokens, cookies y el texto del captcha caducan.
-- Roles, vínculos de token sin `--keep-secrets`, agrupado de endpoints y detección anti-bot son heurísticos.
-- gRPC y protobuf se identifican y no se decodifican.
-- Sin `--no-auto-attach`, iframes, workers y service workers entran en `requests.jsonl`.
-- Una IP histórica sigue en `POSIBLE` hasta verificarla. Un origen verificado puede cerrarse después.
+- Tokens, cookies y el texto del captcha caducan. La caché de sesión es opt-in y tiene TTL.
+- Roles, vínculos de token sin `--keep-secrets` y la detección anti-bot son heurísticos.
+- Protobuf real se probó con captura sintética. Sin `--proto` o `--descriptor` el volcado es genérico.
+- `replay.sh` avisa cuando el POST depende de un token de un solo uso: ese recorrido pasa antes por `flow.sh`.
+- Una IP histórica permanece en `POSIBLE` hasta que el cuerpo o el certificado la confirman.

@@ -208,6 +208,10 @@ Ya están en `requirements.txt` y las instala `setup.sh`:
 | `brotli>=1.1` | Decodificar cuerpos brotli |
 | `zstandard>=0.22` | Decodificar cuerpos zstd |
 | `mmh3>=4.0` | Hash de favicon estilo Shodan (recon) |
+| `protobuf>=5.26` | Decodificar protobuf / gRPC (`--descriptor`, y `--proto`) |
+| `grpcio-tools>=1.62` | Compilar `.proto` para `--proto` (opcional; `--descriptor` solo necesita `protobuf`) |
+
+> `protobuf` / `grpcio-tools` solo se usan para decodificar protobuf: `--descriptor` usa solo `protobuf`, `--proto` además necesita `grpcio-tools`; si faltan, el análisis igual corre y lo indica.
 
 ## Archivos que genera cada corrida (`$RUN/`)
 | Archivo | Qué es |
@@ -222,6 +226,249 @@ Ya están en `requirements.txt` y las instala `setup.sh`:
 | `network.har` | HAR estándar (abrible en DevTools) |
 | `bodies/` | Cuerpos de respuesta guardados |
 | `requests.jsonl` | Una línea por request capturada |
+| `ws_sse.jsonl` | Frames de WebSocket + streams SSE capturados |
+| `schemas/` + `schemas.json` | JSON Schema (draft 2020-12) por endpoint y combinado (se omite con `--no-json-schema`) |
+| `postman_collection.json` | Colección Postman v2.1.0 (se omite con `--no-postman`) |
+| `report.html` | Reporte HTML navegable y autocontenido (se omite con `--no-html`) |
+| `replay.sh` | Script de extracción autogenerado (se omite con `--no-replay-script`) |
+| `security_report.md` | Reporte de `wnm-scan` (hallazgos por severidad) |
+| `security_findings.json` | Hallazgos de `wnm-scan` legibles por máquina |
+
+## `wnm` — CLI unificado (nuevo)
+Un solo comando (`cli.py`) envuelve todos los pasos. `wnm --help` está en español.
+
+| Subcomando | Equivalente | Qué hace |
+|---|---|---|
+| `wnm map <url>` | `wnm-map` | Crawl + captura CDP |
+| `wnm analyze <run>` | `wnm-analyze` | Construye mapas / flujo / salidas |
+| `wnm replay <run> …` | `wnm-replay` | Extrae datos de un endpoint |
+| `wnm recon <dominio>` | `wnm-recon` | Recon pasivo + veredicto de bypass |
+| `wnm watch <url\|run\|api_map.json>` | `wnm-watch` | Snapshot + diff de endpoints |
+| `wnm login <url>` | `wnm-login` | Login headed → storage state |
+| `wnm all <url>` | — | Encadena `map → analyze → (recon) → (watch)` |
+
+Alias: `mapper` (map), `analyse` (analyze), `diff` (watch).
+
+### `wnm all <url>` — pipeline de un tiro
+Corre `map`, luego `analyze`, y opcionalmente `recon` y `watch`. La **última línea impresa es el run dir** (así que `RUN=$(wnm all <url> | tail -1)`).
+
+| Flag (`wnm all`) | Efecto |
+|---|---|
+| `--recon` | Corre también recon después de analyze |
+| `--recon-domain <dominio>` | Hace recon de ese dominio en vez del host mapeado |
+| `--recon-args "<args>"` | Argumentos extra que se pasan al recon |
+| `--watch` | Toma también un snapshot/diff de watch al final |
+
+```bash
+RUN=$(wnm all https://ejemplo.com/ --recon --watch | tail -1)
+```
+
+## Mapper — nuevo: caché de sesión y captura WebSocket/SSE
+
+### Caché reutilizable de sesión / captcha
+Reutiliza opcionalmente un login/captcha ya resuelto entre corridas. **Apagada por defecto.**
+
+| Flag (`wnm-map`) | Efecto |
+|---|---|
+| `--session-cache` | Reusa (y actualiza) la sesión cacheada del dominio |
+| `--no-session-cache` | Nunca lee/escribe la caché (por defecto) |
+| `--human-pause [SEGUNDOS]` | Tras cargar, pausa para que resuelvas login/captcha a mano |
+
+- Cookies + `storage_state` se guardan **por dominio** en `~/.cache/wnm/sessions/<dominio>.json` — **fuera de la carpeta del tool** (permisos `0600`/`0700`) para que los secretos no se filtren al zip.
+- TTL por `WNM_SESSION_TTL` (default `24h`; acepta `s`/`m`/`h`/`d`). Carpeta por `WNM_SESSION_CACHE_DIR`.
+- El estado queda en el bloque `session_cache` de `run_meta.json`.
+
+### Captura de WebSocket y Server-Sent-Events
+Se escribe un archivo nuevo **`ws_sse.jsonl`** en el run dir (`requests.jsonl` no cambia). Registra:
+- Conexiones **WebSocket**: handshake, frames enviados/recibidos, texto o binario (base64).
+- Streams **SSE**: eventos `event` / `data` / `id`.
+- Se captura incluso dentro de iframes/workers/service workers, con deduplicación. Los secretos se redactan salvo `--keep-secrets`.
+
+| Flag (`wnm-map`) | Default | Efecto |
+|---|---|---|
+| `--no-ws` | — | Desactiva la captura WebSocket/SSE |
+| `--max-ws-frames` | `5000` | Tope de frames capturados |
+| `--max-ws-payload` | — | Tope del tamaño de payload por frame |
+
+El estado queda en `ws_sse` de `run_meta.json`; `capabilities` gana `ws_sse_capture` y `session_cache`.
+
+## Analyze — nuevo: esquemas, param-dato, script de replay, protobuf, Postman, HTML
+
+### Inferencia de JSON Schema
+Por cada endpoint de datos se infiere un JSON Schema (**draft 2020-12**) → `schemas/<endpoint>.schema.json` más un `schemas.json` combinado.
+
+| Flag (`wnm-analyze`) | Efecto |
+|---|---|
+| `--json-schema` / `--no-json-schema` | Escribe / omite los esquemas (por defecto: activado) |
+
+### Detección del parámetro-dato
+Cada endpoint recibe un `data_param` — el campo que lleva el valor real de la consulta (una placa, un id, un término de búsqueda) — más una línea **"Extracción sugerida"** en `api_map.md`. Aplica a roles `SEARCH` / `DETAIL` / `LIST`; excluye paginación, captcha, ViewState y wrapper de GraphQL.
+
+### Script de extracción autogenerado (`replay.sh`)
+Se genera `replay.sh`: invoca `wnm-replay` con la paginación ya cableada, y toma el valor de entrada como una variable (p.ej. `$PRODUCT_ID`). `./replay.sh N` corre el endpoint N.
+
+| Flag (`wnm-analyze`) | Efecto |
+|---|---|
+| `--replay-script` / `--no-replay-script` | Escribe / omite `replay.sh` (por defecto: activado) |
+
+> **Nota:** para POST con tokens de un solo uso (ViewState/captcha, p.ej. RUAT), `replay.sh` advierte que primero hay que pasar por `flow.sh` — **no** es extracción masiva automática.
+
+### Decodificación real de protobuf / gRPC (con esquema)
+Si provees un esquema, los cuerpos protobuf/gRPC se decodifican de verdad (maneja el framing gRPC-web de 5 bytes).
+
+| Flag (`wnm-analyze`) | Efecto |
+|---|---|
+| `--proto <archivo\|dir>` | Usa archivo(s) `.proto` (necesita `grpcio-tools`) |
+| `--descriptor <fds>` | Usa un FileDescriptorSet compilado (solo necesita `protobuf`) |
+| `--proto-message TYPE` | Tipo de mensaje con el que decodificar |
+
+Sin esquema hace un volcado genérico marcado *"decodificación genérica sin esquema"*.
+
+### Export a colección Postman
+`postman_collection.json` (schema **v2.1.0**): carpetas por rol, secretos como `{{VAR}}`, `Authorization` como `{{token}}`.
+
+| Flag (`wnm-analyze`) | Efecto |
+|---|---|
+| `--postman` / `--no-postman` | Escribe / omite `postman_collection.json` (por defecto: activado) |
+
+### Reporte HTML navegable
+`report.html` — autocontenido (sin red externa): tabla filtrable, detalle colapsable, diagrama del flujo en HTML/CSS más Mermaid como texto, y secciones de tokens / anti-bot / rate-limit / WS-SSE.
+
+| Flag (`wnm-analyze`) | Efecto |
+|---|---|
+| `--html` / `--no-html` | Escribe / omite `report.html` (por defecto: activado) |
+
+### Resumen `--json` ampliado
+`--json` ahora también incluye: `json_schema`, `json_schema_count`, `postman_file`, `html_file`, `replay_script`, `data_params`, `protobuf_decoded_endpoints`, `ws_sse_streams`. WS/SSE se leen de forma defensiva desde `ws_sse.jsonl`.
+
+## Replay — nuevo: reintentos y resiliencia ante rate-limit
+`wnm-replay` ahora reintenta con **backoff exponencial + jitter** ante errores de red y 5xx, y respeta el rate-limit: ante `429` / `Retry-After` / `X-RateLimit` espera y baja el ritmo (tope 300s).
+
+| Flag (`wnm-replay`) | Default | Efecto |
+|---|---|---|
+| `--backoff` | `0.5` | Segundos base de backoff |
+| `--max-backoff` | `60` | Máximo de segundos de backoff |
+| `--respect-rate-limit` | on | Espera/baja el ritmo ante señales de rate-limit |
+| `--ignore-rate-limit` | — | No baja el ritmo ante rate-limit |
+| `--delay` | (ya existía) | Delay fijo entre requests |
+
+La salida ahora reporta `rate_limit_waits` / `retries`.
+
+## Recon — nuevo: fuentes pasivas extra y verificación TLS
+
+### Fuentes pasivas adicionales
+| Fuente | Variable de entorno | Flag | Sin key |
+|---|---|---|---|
+| VirusTotal | `VIRUSTOTAL_API_KEY` | `--virustotal-key` | se salta ("no configurado") |
+| urlscan.io | `URLSCAN_API_KEY` | `--urlscan-key` | búsqueda pública, cuota reducida |
+| Netlas | `NETLAS_API_KEY` | `--netlas-key` | se salta ("no configurado") |
+
+Sección nueva del reporte: **`## Fuentes pasivas adicionales (VirusTotal / urlscan / Netlas)`**.
+
+### Verificación TLS / certificado
+Se lee el certificado presentado (CN, SAN, issuer, fingerprint SHA256, validez) con `SNI=dominio` y se compara contra el edge. Un match de SAN o de fingerprint promueve la IP a **"sirve el sitio" (cert-match)** y sube la confianza del veredicto. Sección nueva: **`## Verificación TLS / certificado`**.
+
+Todas las candidatas nuevas (`passive:*`, `cert-match`) entran al veredicto de bypass con `Corroborado por: ...`.
+
+## `wnm-watch` — watch / diff de endpoints (nuevo)
+Sigue cómo cambia la superficie de API de un sitio en el tiempo. `wnm-watch <url|run_dir|api_map.json>` toma un snapshot y lo compara con el anterior, detectando **endpoints agregados/quitados**, **cambios de campos/tipos**, y cambios en **tokens, anti-bot, rate-limit y websockets**.
+
+| Flag (`wnm-watch`) | Efecto |
+|---|---|
+| `--baseline` | Hace de este snapshot la base (sin diff) |
+| `--save-only` | Guarda el snapshot, no hace diff |
+| `--no-save` | Solo diff, no guarda el snapshot |
+| `--json` | Emite el diff como JSON |
+| `--name <nombre>` | Nombra esta serie de watch |
+| `--watch-dir <dir>` | Dónde viven los snapshots |
+| `--reanalyze` | Re-analiza antes de tomar el snapshot |
+| `--include-tracking` | Incluye endpoints de tracking/analytics |
+| `--list` | Lista los snapshots existentes |
+
+- Snapshots y diffs viven en `<tool>/.watch/<nombre>/snapshot-*.json` más `diff-*.md` / `diff-*.json`.
+- **Códigos de salida:** `0` sin cambios / base creada · `10` cambios detectados · `1` error/bloqueado · `2` uso.
+- Ideal para una routine programada.
+
+## `wnm-scan` — testing de seguridad (solo objetivos autorizados)
+
+> ⚠️ **Ética primero.** `wnm-scan` (`security.py`) es testing de seguridad ofensivo/defensivo. **Solo corre pruebas activas contra sistemas que sean tuyos o para los que tengas autorización explícita.** Las pruebas activas están **apagadas por defecto**; el análisis pasivo nunca manda requests.
+
+`wnm-scan <run_dir|api_map.json> [--authorized] [opciones]`
+
+### Dos modos
+- **Pasivo (por defecto):** **no** manda requests — solo analiza lo ya capturado.
+- **Activo:** requiere `--authorized` / `--i-have-permission`, sobre objetivos autorizados. Sin `--authorized`, `--only active` aborta.
+
+### Análisis pasivo
+- Scan de secretos (AWS / Stripe / api keys).
+- JWT (`alg:none`, `exp`, claims).
+- Scorecard de headers de seguridad (CSP / HSTS / XFO / XCTO / Referrer / Permissions + flags de cookie).
+- Matriz de autenticación.
+- Superficie GraphQL.
+
+### Pruebas activas (bajo impacto, mismo método observado, comparando contra baseline)
+- Auth roto (sin auth / credencial basura / headers mínimos / JWT expirado).
+- Request incompleto (quitar params requeridos).
+- IDOR / BOLA (ids vecinos).
+- Sondeo de inyección SQLi / XSS / SSTI (por señales, **no** exploits).
+- Sesión / CORS (`Origin` reflejado + credentials, `OPTIONS`/`Allow`).
+- Rate-limit real (ráfaga acotada).
+
+### Salvaguardas
+- Pruebas activas apagadas por defecto.
+- Solo `GET` / `HEAD` / `OPTIONS` o el método observado; `PUT` / `PATCH` / `DELETE` nuevos se bloquean.
+- Payloads de sondeo, no exploits.
+- Cap `--max-requests` (default `100`); `--delay` (default `0.5s`); rate-limit respetado (backoff ante 429).
+- IDOR nunca corre sobre hosts restringidos.
+- El bloqueo `.gob` / `.gov` / `.mil` sigue vigente (solo con `WNM_ALLOW_RESTRICTED=1`).
+
+### Salidas
+- `security_report.md` — resumen ejecutivo + hallazgos por severidad (Crítico / Alto / Medio / Bajo / Info).
+- `security_findings.json` — hallazgos legibles por máquina.
+
+### Flags
+| Flag | Efecto |
+|---|---|
+| `--authorized` / `--i-have-permission` | Habilita las pruebas activas (solo objetivos autorizados) |
+| `--only passive` / `--only active` | Restringe a un modo (`active` necesita `--authorized`) |
+| `--out <ruta>` | Ubicación de salida |
+| `--json` | Emite los hallazgos en JSON |
+| `--max-requests` | Cap de requests activas (default `100`) |
+| `--delay` | Delay entre requests (default `0.5s`) |
+| `--timeout` | Timeout por request |
+| `--insecure` | Omite la verificación TLS |
+| `--header` | Header(s) extra |
+| `--cookies` | Cookies a enviar |
+| `--storage-state` | Storage state de Playwright |
+| `--user-agent` | Sobrescribe el UA |
+| `--max-idor` | Máximo de sondeos IDOR (default `3`) |
+| `--max-injection` | Máximo de sondeos de inyección (default `8`) |
+| `--burst` | Tamaño de ráfaga para rate-limit (default `8`) |
+| `--no-auth-test` / `--no-incomplete` / `--no-idor` / `--no-injection` / `--no-session` / `--no-ratelimit` | Desactiva una prueba activa específica |
+
+## Variables de entorno
+| Variable | Para qué |
+|---|---|
+| `WNM_ALLOW_RESTRICTED` | Ponla en `1` para permitir objetivos `.gob`/`.gov`/`.mil` (solo con autorización explícita) |
+| `WNM_SESSION_TTL` | TTL de la caché de sesión (default `24h`; `s`/`m`/`h`/`d`) |
+| `WNM_SESSION_CACHE_DIR` | Carpeta de la caché de sesión (default `~/.cache/wnm/sessions`) |
+| `SECURITYTRAILS_API_KEY` | SecurityTrails (recon) |
+| `SHODAN_API_KEY` | Shodan (recon) |
+| `CENSYS_API_ID` / `CENSYS_API_SECRET` | Censys (recon) |
+| `VIRUSTOTAL_API_KEY` | VirusTotal (recon, nuevo) |
+| `URLSCAN_API_KEY` | urlscan.io (recon, nuevo; búsqueda pública sin key) |
+| `NETLAS_API_KEY` | Netlas (recon, nuevo) |
+
+## Flujo recomendado con `wnm all`
+```bash
+# map → analyze → recon → watch, de un tiro; la última línea es el run dir
+RUN=$(wnm all https://ejemplo.com/ --recon --watch | tail -1)
+
+# luego, por ejemplo
+xdg-open "$RUN/report.html"        # reporte navegable
+cat      "$RUN/api_map.md"         # endpoints + extracción sugerida
+"$RUN"/replay.sh 1                 # corre el extractor generado para el endpoint 1
+```
 
 ## Sobre el captcha (por qué no es 100% automático)
 El captcha existe justo para impedir el scraping automático. La skill **no lo evita ni lo resuelve

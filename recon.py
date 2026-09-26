@@ -335,6 +335,82 @@ def cert_info(ip, servername, timeout):
     return info
 
 
+def _san_matches(names, domain):
+    """True if any SAN/CN entry equals `domain` or is a wildcard that covers it (one label)."""
+    d = (domain or "").lower().rstrip(".")
+    for n in names or []:
+        n = str(n).lower().rstrip(".")
+        if not n:
+            continue
+        if n == d:
+            return True
+        if n.startswith("*."):
+            base = n[2:]
+            if d == base or (d.endswith("." + base) and d.count(".") == base.count(".") + 1):
+                return True
+    return False
+
+
+def tls_cert_inspect(host, servername, timeout, port=443, match_domain=None):
+    """Open a TLS connection to host:port with SNI=servername and READ the presented certificate
+    (stdlib ssl only, no new deps). Returns a dict: ok, cn, san (list), issuer, fingerprint_sha256,
+    not_before, not_after, and san_match when match_domain is given. Never raises: timeouts,
+    self-signed certs, refused SNI, handshake errors, etc. degrade to {'ok': False, 'error': ...}.
+    This only reads the certificate the server presents; it does not bypass any control."""
+    import socket
+    import ssl
+    import tempfile
+    info = {"ok": False, "sni": servername, "port": port}
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # we only READ the cert (accept self-signed to inspect it)
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=servername) as ss:
+                der = ss.getpeercert(binary_form=True)
+        if not der:
+            info["error"] = "sin certificado"
+            return info
+        info["fingerprint_sha256"] = hashlib.sha256(der).hexdigest()
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        parsed = {}
+        try:
+            tf = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+            tf.write(pem)
+            tf.close()
+            try:
+                parsed = ssl._ssl._test_decode_cert(tf.name)
+            finally:
+                try:
+                    Path(tf.name).unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            parsed = {}
+        san = [v for k, v in (parsed.get("subjectAltName") or []) if str(k).lower() == "dns"]
+        cn = None
+        for rdn in parsed.get("subject", ()) or ():
+            for k, v in rdn:
+                if k in ("commonName", "CN"):
+                    cn = v
+        issuer_parts = []
+        for rdn in parsed.get("issuer", ()) or ():
+            for k, v in rdn:
+                if k in ("organizationName", "commonName", "O", "CN"):
+                    issuer_parts.append(v)
+        info.update({
+            "ok": True, "cn": cn, "san": san,
+            "issuer": ", ".join(dict.fromkeys(issuer_parts)) or None,
+            "not_before": parsed.get("notBefore"), "not_after": parsed.get("notAfter"),
+        })
+        if match_domain:
+            info["san_match"] = _san_matches(list(san) + ([cn] if cn else []), match_domain)
+        return info
+    except Exception as e:  # noqa: BLE001
+        info["error"] = str(e)
+        return info
+
+
 def curl_probe(ip, vhost, scheme, timeout, ua, port=None):
     """curl -k --resolve vhost:port:ip scheme://vhost/  -> dict of response facts.
 
@@ -587,6 +663,115 @@ def censys_hosts(domain, api_id, api_secret, timeout, ua):
     return ips, meta
 
 
+def _collect_ips_from_json(obj, keys):
+    """Recursively collect IPv4 strings found under any of `keys` in a nested JSON structure."""
+    out = set()
+    kset = {k.lower() for k in keys}
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if str(k).lower() in kset:
+                    if isinstance(v, str):
+                        out.add(v)
+                    elif isinstance(v, list):
+                        for x in v:
+                            (out.add(x) if isinstance(x, str) else walk(x))
+                    else:
+                        walk(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+
+    walk(obj)
+    return out
+
+
+def virustotal_domain(domain, api_key, timeout, ua):
+    """VirusTotal passive DNS: historical resolutions (IPs) + subdomains. Returns (ips:set, meta).
+    Key optional; without it the source is skipped with a Spanish 'no configurado' note."""
+    meta = {"source": "virustotal", "ok": False}
+    if not api_key:
+        meta["note"] = "no configurado: exporta VIRUSTOTAL_API_KEY (o usa --virustotal-key)"
+        return set(), meta
+    ips, subs = set(), set()
+    st1, obj = api_get_json(
+        f"https://www.virustotal.com/api/v3/domains/{domain}/resolutions?limit=40",
+        timeout, ua, headers={"x-apikey": api_key})
+    if isinstance(obj, dict):
+        for rec in obj.get("data", []) or []:
+            attr = rec.get("attributes", {}) if isinstance(rec, dict) else {}
+            if attr.get("ip_address"):
+                ips.add(attr["ip_address"])
+    st2, obj2 = api_get_json(
+        f"https://www.virustotal.com/api/v3/domains/{domain}/subdomains?limit=40",
+        timeout, ua, headers={"x-apikey": api_key})
+    if isinstance(obj2, dict):
+        for rec in obj2.get("data", []) or []:
+            sid = rec.get("id") if isinstance(rec, dict) else None
+            if sid:
+                subs.add(str(sid).lower())
+    ips = _ip_set_from(ips)
+    st = st1 or st2
+    meta.update({"ok": (st1 == 200 or st2 == 200), "status": st, "count": len(ips),
+                 "subdomains": sorted(subs)[:50], "subdomain_count": len(subs)})
+    if st and st not in (200, None) and not ips:
+        meta["note"] = f"HTTP {st} (¿clave inválida o límite excedido?)"
+    return ips, meta
+
+
+def urlscan_domain(domain, api_key, timeout, ua):
+    """urlscan.io search: IPs/ASN observed for the domain. The search endpoint is public, so it is
+    queried even without a key (reduced quota); a key (API-Key header) raises the limit.
+    Returns (ips:set, meta)."""
+    meta = {"source": "urlscan", "ok": False}
+    headers = {}
+    if api_key:
+        headers["API-Key"] = api_key
+    else:
+        meta["note"] = "sin clave: búsqueda pública de urlscan (cuota reducida). Exporta URLSCAN_API_KEY para más."
+    from urllib.parse import quote
+    url = f"https://urlscan.io/api/v1/search/?q=domain:{quote(domain)}&size=100"
+    st, obj = api_get_json(url, timeout, ua, headers=headers or None)
+    ips, asns = set(), set()
+    if isinstance(obj, dict):
+        for rec in obj.get("results", []) or []:
+            page = rec.get("page", {}) if isinstance(rec, dict) else {}
+            if page.get("ip"):
+                ips.add(page["ip"])
+            if page.get("asn"):
+                asns.add(str(page["asn"]))
+    ips = _ip_set_from(ips)
+    meta.update({"ok": st == 200, "status": st, "count": len(ips), "asns": sorted(asns)[:20]})
+    if st and st != 200 and api_key:
+        meta["note"] = f"HTTP {st}"
+    return ips, meta
+
+
+def netlas_domain(domain, api_key, timeout, ua):
+    """Netlas.io: hosts / certificate data associated with the domain. Returns (ips:set, meta).
+    Key optional; without it the source is skipped with a Spanish 'no configurado' note."""
+    meta = {"source": "netlas", "ok": False}
+    if not api_key:
+        meta["note"] = "no configurado: exporta NETLAS_API_KEY (o usa --netlas-key)"
+        return set(), meta
+    from urllib.parse import quote
+    url = (f"https://app.netlas.io/api/domains/?q={quote('domain:' + domain)}"
+           f"&source_type=include&start=0")
+    st, obj = api_get_json(url, timeout, ua, headers={"X-API-Key": api_key})
+    ips = set()
+    if isinstance(obj, dict):
+        items = obj.get("items") or obj.get("data") or obj
+        ips |= _collect_ips_from_json(items, ("a", "ip", "ip_address", "addr", "address"))
+    ips = _ip_set_from(ips)
+    meta.update({"ok": st == 200, "status": st, "count": len(ips)})
+    if st and st != 200:
+        meta["note"] = f"HTTP {st}"
+    return ips, meta
+
+
 COMMON_ORIGIN_SUBS = ("mail", "smtp", "ftp", "cpanel", "webmail", "direct", "origin", "server")
 
 
@@ -767,6 +952,12 @@ def main(argv=None):
     ap.add_argument("--shodan-key", default=None, help="Shodan API key (overrides $SHODAN_API_KEY)")
     ap.add_argument("--censys-id", default=None, help="Censys API ID (overrides $CENSYS_API_ID)")
     ap.add_argument("--censys-secret", default=None, help="Censys API secret (overrides $CENSYS_API_SECRET)")
+    ap.add_argument("--virustotal-key", default=None,
+                    help="VirusTotal API key (overrides $VIRUSTOTAL_API_KEY)")
+    ap.add_argument("--urlscan-key", default=None,
+                    help="urlscan.io API key (overrides $URLSCAN_API_KEY; búsqueda pública si falta)")
+    ap.add_argument("--netlas-key", default=None,
+                    help="Netlas API key (overrides $NETLAS_API_KEY)")
     ap.add_argument("--scan-range", action="store_true",
                     help="scan the /24 (see --range-prefix) around a verified origin for siblings (opt-in, slow)")
     ap.add_argument("--range-prefix", type=int, default=24, help="CIDR prefix length for --scan-range (default 24)")
@@ -859,6 +1050,9 @@ def main(argv=None):
     shodan_key = args.shodan_key or os.environ.get("SHODAN_API_KEY")
     censys_id = args.censys_id or os.environ.get("CENSYS_API_ID")
     censys_secret = args.censys_secret or os.environ.get("CENSYS_API_SECRET")
+    vt_key = args.virustotal_key or os.environ.get("VIRUSTOTAL_API_KEY")
+    urlscan_key = args.urlscan_key or os.environ.get("URLSCAN_API_KEY")
+    netlas_key = args.netlas_key or os.environ.get("NETLAS_API_KEY")
 
     # 4b) passive infra DNS (MX / TXT / SPF / DMARC + common origin-leaking subdomains)
     log("querying infra DNS records (MX/TXT/SPF/DMARC + common subdomains)")
@@ -892,6 +1086,55 @@ def main(argv=None):
         if ips:
             log(f"  {name}: {len(ips)} historical IP(s)")
         time.sleep(delay)
+
+    # 4c-bis) extra passive sources (VirusTotal / urlscan / Netlas). Each degrades to a
+    # "no configurado" note when its key is missing; urlscan works publicly without a key.
+    extra_meta = {}
+    extra_subdomains = set()
+    log("consultando fuentes pasivas extra (VirusTotal / urlscan / Netlas)")
+    for name, fn, fn_args in (
+        ("virustotal", virustotal_domain, (domain, vt_key, timeout, ua)),
+        ("urlscan", urlscan_domain, (domain, urlscan_key, timeout, ua)),
+        ("netlas", netlas_domain, (domain, netlas_key, timeout, ua)),
+    ):
+        try:
+            ips, meta = fn(*fn_args)
+        except Exception as e:  # noqa: BLE001
+            ips, meta = set(), {"source": name, "ok": False, "error": str(e)}
+        extra_meta[name] = meta
+        for ip in ips:
+            if not ip_in_cf(ip, cf_v4, cf_v6):
+                _add_cand(ip, f"passive:{meta.get('source', name)}")
+        for sd in meta.get("subdomains", []) or []:
+            sd = str(sd).lower().strip().lstrip("*.")
+            if sd == domain or sd.endswith("." + domain):
+                extra_subdomains.add(sd)
+        if ips:
+            log(f"  {name}: {len(ips)} IP(s) candidata(s) (no-Cloudflare)")
+        time.sleep(delay)
+    # merge any new subdomains VirusTotal surfaced (they still get resolved/classified below is
+    # already done, so record them and resolve+classify the new ones here defensively)
+    new_subs = sorted(sd for sd in extra_subdomains if not any(rec["host"] == sd for rec in records))
+    for sd in new_subs:
+        try:
+            rec = resolve_host(sd, timeout, args.resolver)
+        except Exception:  # noqa: BLE001
+            continue
+        all_a = rec["a"] + rec["aaaa"]
+        cname_cf = any("cloudflare" in c.lower() for c in rec["cname"])
+        cf_hit = any(ip_in_cf(ip, cf_v4, cf_v6) for ip in all_a)
+        if not all_a and not rec["cname"]:
+            label = "no-record"
+        elif cf_hit or cname_cf:
+            label = "cloudflare"
+        else:
+            label = "direct"
+        if label == "direct":
+            for ip in all_a:
+                direct_ips.setdefault(ip, set()).add(sd)
+                _add_cand(ip, "passive:virustotal")
+        records.append({"host": sd, "a": rec["a"], "aaaa": rec["aaaa"], "cname": rec["cname"],
+                        "label": label, "c99_ip": None})
 
     # 4d) favicon hash + Shodan favicon correlation (find origins serving the same favicon)
     fav_hash, fav_meta = favicon_hash(domain, timeout, ua)
@@ -947,6 +1190,19 @@ def main(argv=None):
     # 5) verify candidates (ping + Host-spoofed HTTP(S) + TLS cert; body-hash & title matching)
     verify = {}
     edge_titles = {norm_title(v.get("title")) for v in edge.values() if v.get("title")}
+    # baseline TLS cert served by the edge/domain (stdlib ssl), for fingerprint/SAN comparison
+    edge_tls = {}
+    edge_fps = set()
+    if not args.no_verify:
+        for vhost in (domain, f"www.{domain}"):
+            try:
+                ci = tls_cert_inspect(vhost, vhost, min(timeout, 10), match_domain=domain)
+            except Exception as e:  # noqa: BLE001
+                ci = {"ok": False, "error": str(e)}
+            edge_tls[vhost] = ci
+            if ci.get("fingerprint_sha256"):
+                edge_fps.add(ci["fingerprint_sha256"])
+            time.sleep(delay)
     for ip in candidates:
         srcs = sorted(cand_sources.get(ip, []))
         hosts = sorted(direct_ips.get(ip, []))
@@ -960,6 +1216,18 @@ def main(argv=None):
             time.sleep(delay)
         if not args.no_verify:
             entry["cert"] = cert_info(ip, f"www.{domain}", timeout)
+            # stdlib TLS inspection of the cert this IP presents with SNI = target domain
+            try:
+                tls = tls_cert_inspect(ip, domain, min(timeout, 10), match_domain=domain)
+            except Exception as e:  # noqa: BLE001
+                tls = {"ok": False, "error": str(e)}
+            entry["tls"] = tls
+            entry["san_match"] = bool(tls.get("san_match"))
+            entry["fp_match"] = bool(tls.get("fingerprint_sha256") and tls["fingerprint_sha256"] in edge_fps)
+            if entry["san_match"] or entry["fp_match"]:
+                # strong evidence the IP directly serves the same site -> promote to served & verdict
+                entry["serves_site"] = True
+                _add_cand(ip, "cert-match")
             best = None
             served_by = None
             for vhost in (domain, f"www.{domain}"):
@@ -1022,7 +1290,8 @@ def main(argv=None):
     apex_on_cf = bool(zone_on_cf or (apex_rec and apex_rec["label"] == "cloudflare"))
     any_cf = apex_on_cf or any(rec["label"] == "cloudflare" for rec in records)
     def _is_corroborating(src):
-        return src.startswith("historical:") or src.startswith("favicon:")
+        return (src.startswith("historical:") or src.startswith("favicon:")
+                or src.startswith("passive:") or src == "cert-match")
 
     hist_ips = sorted({ip for ip, s in cand_sources.items() if any(_is_corroborating(x) for x in s)})
 
@@ -1088,11 +1357,18 @@ def main(argv=None):
         "dns_infra": dns_infra,
         "favicon": {**fav_meta, "search": fav_search_meta},
         "historical_sources": hist_meta,
+        "passive_sources": extra_meta,
+        "tls_edge": edge_tls,
         "anti_bot": anti_bot,
         "range_scan": range_scan,
         "flags": {k: getattr(args, k) for k in
                   ("no_c99", "no_crtsh", "no_ping", "no_verify", "resolve_only", "no_browser",
                    "scan_range", "range_prefix", "range_max", "json")},
+        "api_keys_configured": {
+            "securitytrails": bool(st_key), "shodan": bool(shodan_key),
+            "censys": bool(censys_id and censys_secret), "virustotal": bool(vt_key),
+            "urlscan": bool(urlscan_key), "netlas": bool(netlas_key),
+        },
     }
     (out_dir / "recon.json").write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
     (out_dir / "subdomains.txt").write_text("\n".join(hosts) + "\n", encoding="utf-8")
@@ -1291,6 +1567,34 @@ def write_report(path, r):
             L.append(f"- `{ip}` — fuentes: {', '.join(cs[ip])}")
     L.append("")
 
+    # ---- extra passive sources: VirusTotal / urlscan / Netlas ----
+    L.append("## Fuentes pasivas adicionales (VirusTotal / urlscan / Netlas)\n")
+    L.append("Fuentes OSINT opcionales por clave de API propia del usuario. Cada IP que aportan entra al "
+             "mismo camino de verificación (probe HTTP(S) + TLS) que las demás candidatas y suma a "
+             "`bypass_verdict`; cuando varias fuentes independientes coinciden en una IP, sube la confianza "
+             "(ver \"Corroborado por\").\n")
+    ps = r.get("passive_sources") or {}
+    if not ps:
+        L.append("- (no se consultaron fuentes pasivas adicionales)")
+    labels = {"virustotal": "VirusTotal", "urlscan": "urlscan.io", "netlas": "Netlas"}
+    for name in ("virustotal", "urlscan", "netlas"):
+        meta = ps.get(name)
+        if not meta:
+            continue
+        title = labels.get(name, name)
+        if meta.get("ok"):
+            det = f"{meta.get('count', 0)} IP(s) candidata(s)"
+            if meta.get("subdomain_count"):
+                det += f", {meta['subdomain_count']} subdominio(s)"
+            if meta.get("asns"):
+                det += f", ASN: {', '.join(meta['asns'][:8])}"
+            L.append(f"- **{title}:** {det} (HTTP {meta.get('status', '?')})")
+        elif meta.get("note"):
+            L.append(f"- **{title}:** {meta['note']}")
+        else:
+            L.append(f"- **{title}:** sin datos ({meta.get('error') or 'HTTP ' + str(meta.get('status', '?'))})")
+    L.append("")
+
     # ---- anti-bot protection ----
     ab = r.get("anti_bot")
     if ab is not None:
@@ -1341,6 +1645,40 @@ def write_report(path, r):
                     sv = f"**YES** ({extra})" if extra else "**YES**"
                 L.append(f"| {ip} | {pstr} | {pd} | {sv} | {cs} |")
             L.append("")
+
+    if not r["flags"]["no_verify"]:
+        L.append("## Verificación TLS / certificado\n")
+        L.append("Lectura (solo lectura) del certificado que presenta cada IP candidata al abrir TLS con "
+                 "SNI = dominio objetivo (stdlib `ssl`). Si el SAN incluye el dominio (o un wildcard que lo "
+                 "cubre) y/o el fingerprint SHA256 coincide con el del edge, es evidencia fuerte de que esa "
+                 "IP directa sirve el mismo sitio (`cert-match`).\n")
+        et = r.get("tls_edge") or {}
+        for vhost, ci in et.items():
+            if ci.get("ok"):
+                L.append(f"- **Edge `{vhost}`:** CN={ci.get('cn')!r} · fingerprint `"
+                         f"{(ci.get('fingerprint_sha256') or '')[:16]}…` · válido hasta {ci.get('not_after')}")
+            else:
+                L.append(f"- **Edge `{vhost}`:** cert no leído ({ci.get('error', 'n/a')})")
+        L.append("")
+        tls_rows = [(ip, e) for ip, e in verify.items() if e.get("tls")]
+        if tls_rows:
+            L.append("| Candidate IP | CN | SAN match | Fingerprint match | Issuer | Válido hasta |")
+            L.append("|--------------|----|-----------|-------------------|--------|--------------|")
+            for ip, e in tls_rows:
+                t = e.get("tls") or {}
+                if not t.get("ok"):
+                    L.append(f"| {ip} | - | - | - | (sin cert: {t.get('error', 'n/a')}) | - |")
+                    continue
+                sanm = "**sí**" if e.get("san_match") else "no"
+                fpm = "**sí**" if e.get("fp_match") else "no"
+                san_preview = ", ".join((t.get("san") or [])[:4])
+                cnp = t.get("cn") or "-"
+                if san_preview:
+                    cnp = f"{cnp} (SAN: {san_preview})"
+                L.append(f"| {ip} | {cnp} | {sanm} | {fpm} | {t.get('issuer', '-')} | {t.get('not_after', '-')} |")
+            L.append("")
+        else:
+            L.append("No hubo IPs candidatas con lectura de certificado en esta ejecución.\n")
 
     rs = r.get("range_scan") or {}
     if rs.get("ran"):

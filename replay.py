@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import re
 import sys
 import time
@@ -33,6 +34,8 @@ from wnm_common import (  # noqa: E402
 OFFSET_LIKE = re.compile(r"^(offset|start|skip|from|startindex|start_index)$", re.I)
 LIMIT_LIKE = re.compile(r"^(limit|per_?page|page_?size|size|count|take|rows|first)$", re.I)
 STOP_KEYS = ("has_next", "hasNext", "has_more", "hasMore", "hasNextPage", "more")
+# Hard cap on any single rate-limit wait so a bogus Retry-After can never hang the run.
+RL_WAIT_CAP = 300.0
 
 
 def log(*a):
@@ -153,23 +156,111 @@ def build_headers(ep, args) -> dict:
     return h
 
 
-def request_with_retry(client, method, url, headers, content, args):
+def _to_float(v):
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_retry_after(value):
+    """Parse a Retry-After header value: delta-seconds or an HTTP-date. Returns seconds or None."""
+    if not value:
+        return None
+    f = _to_float(value)
+    if f is not None:
+        return max(0.0, f)
+    try:  # HTTP-date form
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value.strip())
+        if dt is not None:
+            now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+            return max(0.0, (dt - now).total_seconds())
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def rate_limit_delay(resp):
+    """Inspect a response for rate-limit signals. Returns (seconds:float|None, reason:str).
+
+    Honours Retry-After first, then X-RateLimit-Remaining==0 + X-RateLimit-Reset (epoch or delta).
+    None means no wait is indicated. Never raises."""
+    try:
+        h = resp.headers
+    except Exception:  # noqa: BLE001
+        return None, ""
+    ra = parse_retry_after(h.get("retry-after"))
+    if ra is not None:
+        return ra, "retry-after"
+    remaining = _to_float(h.get("x-ratelimit-remaining") or h.get("x-rate-limit-remaining")
+                          or h.get("ratelimit-remaining"))
+    reset = h.get("x-ratelimit-reset") or h.get("x-rate-limit-reset") or h.get("ratelimit-reset")
+    if remaining is not None and remaining <= 0 and reset is not None:
+        rf = _to_float(reset)
+        if rf is not None:
+            wait = (rf - time.time()) if rf > 1e6 else rf  # large value => epoch seconds
+            return max(0.0, wait), "x-ratelimit-reset"
+    return None, ""
+
+
+def request_with_retry(client, method, url, headers, content, args, stats=None):
+    """Send a request with resilient retries.
+
+    - Transport errors and 5xx use exponential backoff with jitter (base=--backoff, cap=--max-backoff).
+    - Unless --ignore-rate-limit, 429 and Retry-After / X-RateLimit-* headers are honoured: we wait the
+      indicated time before retrying, and slow down proactively when the quota is exhausted.
+    Records how many rate-limit waits happened in `stats`. --retries still bounds the retry count and
+    everything degrades cleanly when the new flags are absent."""
+    if stats is None:
+        stats = {}
+    base = getattr(args, "backoff", 0.5)
+    base = 0.5 if base is None else max(0.0, base)
+    max_backoff = getattr(args, "max_backoff", 60.0) or 60.0
+    respect_rl = getattr(args, "respect_rate_limit", True)
+
+    def _backoff(attempt):
+        return min(max_backoff, base * (2 ** attempt)) + random.uniform(0, base)
+
+    def _record_rl(wait, reason):
+        stats["rate_limit_waits"] = stats.get("rate_limit_waits", 0) + 1
+        stats["rate_limit_wait_s"] = stats.get("rate_limit_wait_s", 0.0) + wait
+        log(f"  rate-limit ({reason}): esperando {wait:.1f}s antes de continuar")
+
+    r = None
     for attempt in range(args.retries + 1):
         try:
             r = client.request(method, url, headers=headers, content=content)
         except httpx.HTTPError as e:
             if attempt >= args.retries:
                 raise
-            wait = 2 ** attempt
-            log(f"  transport error {e!r}; retry in {wait}s")
+            wait = _backoff(attempt)
+            stats["retries"] = stats.get("retries", 0) + 1
+            log(f"  transport error {e!r}; retry {attempt + 1}/{args.retries} in {wait:.1f}s")
             time.sleep(wait)
             continue
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < args.retries:
-            ra = r.headers.get("retry-after")
-            wait = float(ra) if ra and ra.isdigit() else 2 ** (attempt + 1)
-            log(f"  HTTP {r.status_code}; retry in {wait}s")
-            time.sleep(min(wait, 120))
+        rl_wait, rl_reason = rate_limit_delay(r) if respect_rl else (None, "")
+        if r.status_code == 429 and attempt < args.retries:
+            wait = rl_wait if (rl_wait is not None) else _backoff(attempt + 1)
+            wait = min(wait, RL_WAIT_CAP) + random.uniform(0, base)
+            _record_rl(wait, rl_reason or "429")
+            time.sleep(wait)
             continue
+        if r.status_code in (500, 502, 503, 504) and attempt < args.retries:
+            if rl_wait is not None and rl_reason == "retry-after":
+                wait = min(rl_wait, RL_WAIT_CAP) + random.uniform(0, base)
+                _record_rl(wait, rl_reason)
+            else:
+                wait = _backoff(attempt + 1)
+                stats["retries"] = stats.get("retries", 0) + 1
+                log(f"  HTTP {r.status_code}; retry {attempt + 1}/{args.retries} in {wait:.1f}s")
+            time.sleep(wait)
+            continue
+        # success / non-retryable: if the quota is exhausted, pause to be polite before the next page
+        if respect_rl and r.status_code < 400 and rl_wait is not None and rl_wait > 0:
+            wait = min(rl_wait, RL_WAIT_CAP) + random.uniform(0, base)
+            _record_rl(wait, (rl_reason or "cuota agotada") + ", bajando el ritmo")
+            time.sleep(wait)
         return r
     return r
 
@@ -195,6 +286,13 @@ def main(argv=None):
     g.add_argument("--user-agent")
     g.add_argument("--timeout", type=float, default=30)
     g.add_argument("--retries", type=int, default=3)
+    g.add_argument("--backoff", type=float, default=0.5,
+                   help="base for exponential backoff with jitter on network errors / 5xx (seconds)")
+    g.add_argument("--max-backoff", type=float, default=60.0, help="cap for a single backoff wait (seconds)")
+    g.add_argument("--respect-rate-limit", dest="respect_rate_limit", action="store_true", default=True,
+                   help="honour 429 / Retry-After / X-RateLimit-* by waiting (default on)")
+    g.add_argument("--ignore-rate-limit", dest="respect_rate_limit", action="store_false",
+                   help="do not wait on rate-limit signals")
     g.add_argument("--insecure", action="store_true", help="skip TLS verification")
     g = ap.add_argument_group("pagination")
     g.add_argument("--paginate", metavar="PARAM", help="query param to iterate (or body:<json.path>)")
@@ -315,6 +413,7 @@ def main(argv=None):
     client = build_client(args, ep)
     cur_url = url
     stop_reason = "max-pages reached"
+    net_stats = {"rate_limit_waits": 0, "rate_limit_wait_s": 0.0, "retries": 0}
     try:
         while pages_done < max_pages:
             req_url, req_body = cur_url, body_json
@@ -348,7 +447,7 @@ def main(argv=None):
                 print(json.dumps({"method": method, "url": req_url, "headers": headers,
                                   "body": content if isinstance(content, str) else (content or b"").decode()}, indent=2))
                 return 0
-            r = request_with_retry(client, method, req_url, headers, content, args)
+            r = request_with_retry(client, method, req_url, headers, content, args, net_stats)
             pages_done += 1
             data = None
             try:
@@ -436,8 +535,13 @@ def main(argv=None):
                 w.writerow(row)
         outputs.append(p)
     summary = {"endpoint": ep["key"], "requests": pages_done, "records": len(all_records), "stop_reason": stop_reason,
+               "rate_limit_waits": net_stats.get("rate_limit_waits", 0),
+               "rate_limit_wait_s": round(net_stats.get("rate_limit_wait_s", 0.0), 2),
+               "retries": net_stats.get("retries", 0),
                "outputs": [str(p.resolve()) for p in outputs]}
-    log(f"done: {len(all_records)} records from {pages_done} requests ({stop_reason})")
+    _rl = net_stats.get("rate_limit_waits", 0)
+    log(f"done: {len(all_records)} records from {pages_done} requests ({stop_reason})"
+        + (f"; {_rl} espera(s) por rate-limit (~{net_stats.get('rate_limit_wait_s', 0.0):.1f}s)" if _rl else ""))
     print(json.dumps(summary, indent=2))
     return 0
 
