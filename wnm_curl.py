@@ -118,16 +118,24 @@ def build_curl(method: str, url: str, headers: dict | None, body: str | None, re
     args.append(_redact_url(url, v, redact))
     for h in hdr_args:
         args += ["-H", h]
+    raw_idx = set()  # arg indices emitted verbatim (not shell-quoted)
     if body:
         if len(body) > max_body:
             body = body[:max_body]
             args_note = f"# NOTE: body truncated to {max_body} bytes"
         else:
             args_note = None
-        args += ["--data-raw", _redact_body(body, ct, v, redact)]
+        if _is_binary(body):
+            # binary payload (gRPC-web / protobuf): shell args cannot carry NUL bytes, so feed the exact
+            # bytes through process substitution (bash) instead of --data-raw
+            args += ["--data-binary", _printf_subst(body)]
+            raw_idx.add(len(args) - 1)
+            args_note = ((args_note + "\n") if args_note else "") + "# NOTE: binary body (protobuf/gRPC) sent via --data-binary @<(printf ...) (bash)"
+        else:
+            args += ["--data-raw", _redact_body(body, ct, v, redact)]
     else:
         args_note = None
-    q = [_sh(a) if i else a for i, a in enumerate(args)]
+    q = [_sh(a) if i and i not in raw_idx else a for i, a in enumerate(args)]
     # multiline: "curl -sS -X M [--compressed]", then URL, then one "-H ..." / "--data-raw ..." per line
     n_head = 5 if compressed else 4
     lines = [" ".join(q[:n_head]), q[n_head]]
@@ -138,6 +146,25 @@ def build_curl(method: str, url: str, headers: dict | None, body: str | None, re
         multiline = args_note + "\n" + multiline
     return {"args": [(_PH_RE.sub(lambda m: "$" + m.group(1), a)) for a in args],
             "multiline": multiline, "oneline": " ".join(q), "env": v.vars}
+
+
+def _is_binary(body) -> bool:
+    if isinstance(body, bytes):
+        return True
+    return any((ord(ch) < 32 and ch not in "\t\n\r") for ch in body[:4096])
+
+
+def _printf_subst(body) -> str:
+    """`@<(printf '\\ooo...')` reproducing the exact bytes (latin-1 for str bodies that hold raw bytes)."""
+    if isinstance(body, str):
+        try:
+            data = body.encode("latin-1")
+        except UnicodeEncodeError:
+            data = body.encode("utf-8")
+    else:
+        data = body
+    esc = "".join(chr(b) if (32 <= b < 127 and chr(b) not in "\\'%") else f"\\{b:03o}" for b in data)
+    return f"@<(printf '{esc}')"
 
 
 def _canon(h: str) -> str:

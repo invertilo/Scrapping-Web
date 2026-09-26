@@ -1,2 +1,7 @@
 playwright>=1.47
 httpx>=0.27
+# optional but recommended: transparent brotli / zstd body decoding in analyze.py
+brotli>=1.1
+zstandard>=0.22
+# optional but recommended: Shodan-style favicon hashing in recon.py
+mmh3>=4.0

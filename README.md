@@ -28,61 +28,36 @@
   Mapea un sitio leyendo el mismo tráfico que muestra la pestaña <strong>Network</strong> de DevTools.
 </p>
 
-Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP). Con esa captura arma cuatro resultados:
+Abre el sitio en un Chromium controlado por Playwright y registra cada request y cada respuesta con el protocolo de DevTools de Chrome (CDP). Con esa captura arma el mapa de páginas, el mapa de APIs, el flujo de inicio a fin y un curl por paso. Después puede repetir esas APIs con paginación y exportar JSON o CSV.
 
-| Resultado | Dónde queda |
-|---|---|
-| Mapa de páginas | `pages.json` |
-| Mapa de APIs | `api_map.md` |
-| Flujo de inicio a fin | `flow.md` y `flow.sh` |
-| Un curl por paso | dentro del flujo y en `curls.sh` |
-
-Después puede volver a llamar esas APIs con paginación y exportar los datos a JSON o CSV. También hace reconocimiento pasivo de un dominio: subdominios, detección de Cloudflare y posibles IPs de origen.
+El uso es en páginas y APIs para las que tienes permiso: un pentest, una auditoría o un sitio propio. Los dominios `.gob`, `.gov` y `.mil` (y variantes como `gob.bo` o `gov.co`) se rechazan solos. Con autorización explícita para ese sitio, antepón `WNM_ALLOW_RESTRICTED=1`.
 
 ## La skill
 
-`SKILL.md` es la guía que usa un agente para correr esta herramienta de principio a fin. Le dice cuándo mapear, cómo leer el flujo, cómo sacar el curl de cada paso y cómo repetir un endpoint con paginación. El agente sigue ese orden en un sitio que ya estás autorizado a probar, y te deja el mapa, el flujo y los datos exportados.
-
-Está pensada para seguridad ofensiva: en un pentest, el valor está en los endpoints que la aplicación llama de verdad (XHR, fetch, GraphQL), en el orden en que se llaman y en poder repetirlos. La skill convierte esa captura en un recorrido reproducible: cada paso tiene su curl, los endpoints quedan agrupados y los que paginan se pueden recorrer solos hasta exportar JSON o CSV.
-
-El uso es en páginas y APIs para las que tienes permiso. Un pentest, una auditoría o un sitio propio. Los dominios `.gob`, `.gov` y `.mil` se rechazan si no hay una autorización explícita para ese objetivo.
+`SKILL.md` es la guía que usa un agente para correr la herramienta de principio a fin en un sitio autorizado. Ahora no se queda en “captura y saca curls”: clasifica los endpoints, sigue el token de un paso al siguiente, marca la protección anti-bot y deja un OpenAPI para repetir el trabajo.
 
 | Con la skill | Sin la skill |
 |---|---|
-| El agente captura el tráfico real y arma el mapa de endpoints solo. | Hay que abrir DevTools, copiar cada request y ordenarlas a mano. |
-| Entrega el flujo completo, del primer load a la respuesta con datos, con un curl por paso. | Queda la última llamada visible y se pierde el camino que llegó hasta ahí. |
-| Marca captcha y desafíos para que los resuelva una persona, y sigue con el resto. | Esos pasos se mezclan con las APIs y el recorrido se corta. |
-| Repite el endpoint página por página y deja JSON y CSV. | La paginación y la exportación se escriben de cero en cada prueba. |
-| Oculta cookies y tokens en los curl y parte de un alcance acotado. | Es fácil pegar secretos en notas o probar fuera del sitio autorizado. |
+| Captura también iframes, workers y service workers, y decodifica gzip, deflate, brotli y zstd. | Esas llamadas quedan fuera de `requests.jsonl` y los cuerpos comprimidos no se leen. |
+| Arma el flujo completo y encadena en `flow.sh` cookies, JWT, CSRF y JSF ViewState. | Hay que copiar cada token a mano entre un paso y el siguiente. |
+| Marca cada endpoint como `SEARCH`, `LIST` o `DETAIL`, confirma el paginador y avisa del rate limit. | La paginación se adivina y un `429` se ve tarde. |
+| Detecta Cloudflare, hCaptcha, reCAPTCHA, Akamai, PerimeterX, DataDome, Imperva y captcha propio, y sugiere una estrategia. | La protección se descubre cuando la request ya falló. |
+| Exporta `openapi.json` y un resumen `--json` para automatizar el pentest. | El mapa queda solo en un markdown que hay que releer. |
+| En el recon, junta IP histórica, favicon, DNS de infraestructura y un veredicto `SI` / `POSIBLE` / `NO`. | Cada fuente se consulta por separado y el origen queda en una nota. |
+
+La detección anti-bot identifica y aconseja. No evade la protección. Una IP histórica es una pista: el veredicto se queda en `POSIBLE` hasta que el origen se verifica. Las API keys van en variables de entorno.
 
 ## Contenido
 
 - [La skill](#la-skill)
-- [Piezas](#piezas)
 - [Instalación](#instalación)
-- [Capturar y mapear](#capturar-y-mapear)
-- [Flujo de inicio a fin](#flujo-de-inicio-a-fin)
-- [Mapa de APIs](#mapa-de-apis)
-- [Extraer datos](#extraer-datos)
-- [Recon pasivo](#recon-pasivo)
+- [Uso rápido](#uso-rápido)
+- [Piezas](#piezas)
+- [Mapeo y análisis](#mapeo-y-análisis)
+- [Recon](#recon)
 - [Archivos de cada corrida](#archivos-de-cada-corrida)
-- [Curl y secretos](#curl-y-secretos)
 - [Captcha](#captcha)
-- [Seguridad](#seguridad)
 - [Límites](#límites)
-
-## Piezas
-
-| Módulo | Qué hace |
-|---|---|
-| `mapper.py` | Recorre el sitio y captura el tráfico: HAR, cuerpos de respuesta y un log por request. |
-| `analyze.py` | Agrupa las requests en endpoints, detecta paginación y GraphQL, arma el flujo ordenado, marca los pasos de captcha y genera los curl. |
-| `replay.py` | Vuelve a llamar un endpoint página por página y guarda los resultados. |
-| `recon.py` | Reconocimiento pasivo de un dominio: subdominios, Cloudflare y posibles IPs de origen. |
-| `wnm_common.py` | Utilidades compartidas: oculta secretos y bloquea dominios restringidos. |
-| `wnm_curl.py` | Arma los comandos curl a partir de las requests capturadas. |
-
-Los comandos de uso son `wnm-map`, `wnm-analyze`, `wnm-replay`, `wnm-recon` y `wnm-login`.
 
 ## Instalación
 
@@ -92,124 +67,126 @@ cd Scrapping-Web
 ./setup.sh
 ```
 
-`setup.sh` crea el entorno virtual e instala Playwright y Chromium. En los ejemplos de abajo, `T` es la carpeta del clon.
+`setup.sh` crea el entorno virtual e instala Playwright, Chromium y las dependencias de decodificación y favicon.
 
-## Capturar y mapear
+| Paquete | Para qué |
+|---|---|
+| `playwright>=1.47` | Chromium y CDP |
+| `httpx>=0.27` | Replay de endpoints |
+| `brotli>=1.1` | Cuerpos brotli |
+| `zstandard>=0.22` | Cuerpos zstd |
+| `mmh3>=4.0` | Hash de favicon estilo Shodan |
+
+## Uso rápido
 
 ```bash
-T="$PWD"
-RUN=$($T/wnm-map https://ejemplo.com/ --depth 1 --max-pages 20 | tail -1)
-echo "$RUN"
+RUN=$(./wnm-map https://ejemplo.com/ --depth 1 --max-pages 20 | tail -1)
+bash $RUN/flow.sh
+./wnm-replay $RUN --list
+./wnm-replay $RUN/api_map.json 1 --paginate page --max-pages 0 --format both
+./wnm-recon ejemplo.com
 ```
-
-`$RUN` es la carpeta con todos los resultados de esa corrida.
 
 | Flag | Para qué |
 |---|---|
 | `--scroll` | Scroll infinito y carga perezosa. |
 | `--actions archivo.json` | Clics y escritura que disparan requests. Ver `examples/`. |
-| `--headed` | Muestra el navegador para llenar un formulario o un captcha a mano. |
+| `--headed` | Muestra el navegador para un formulario o un captcha. |
 | `--emit-curl api` | Vuelca las requests como curl en `curls.sh`. |
-| `--include REGEX` | Se queda solo con las URLs que coinciden. |
-| `--block image,font` | Descarta tipos de recurso que no aportan al mapa. |
+| `--no-auto-attach` | Captura solo la página principal, sin iframes ni workers. |
+| `--keep-secrets` | Guarda cookies y tokens reales para confirmar el flujo de auth. |
 
-Para un sitio con login, primero guarda la sesión:
+Para un sitio con login: `./wnm-login https://ejemplo.com/login --out estado.json` y luego `--storage-state estado.json`.
 
-```bash
-$T/wnm-login https://ejemplo.com/login
-```
+## Piezas
 
-El navegador se abre y completas el acceso. La sesión queda guardada y se reutiliza con `--storage-state` o `--cookies`.
+| Comando | Módulo | Qué hace |
+|---|---|---|
+| `wnm-map` | `mapper.py` | Recorre el sitio y captura el tráfico. |
+| `wnm-analyze` | `analyze.py` | Agrupa endpoints, arma el flujo, los curl y el OpenAPI. |
+| `wnm-replay` | `replay.py` | Repite un endpoint con paginación y guarda JSON/CSV. |
+| `wnm-recon` | `recon.py` | Recon del dominio y veredicto de origen. |
+| `wnm-login` | `login.py` | Abre el navegador, guarda la sesión. |
+| | `wnm_common.py` | Oculta secretos, bloquea dominios restringidos y detecta anti-bot. |
+| | `wnm_curl.py` | Arma los curl, también con cuerpo binario. |
 
-## Flujo de inicio a fin
+## Mapeo y análisis
 
-El archivo central es `$RUN/flow.md`: la secuencia ordenada de todas las requests, desde que se abre la página hasta la respuesta con los datos, con el curl de cada paso. Los pasos que necesitan a una persona (captcha, desafío) van marcados con 🧑.
+### Cuerpos, gRPC y GraphQL
 
-```bash
-bash $RUN/flow.sh
-```
+Los cuerpos **gzip, deflate, brotli y zstd** se decodifican solos, por `content-encoding` o por magic bytes. **gRPC / protobuf** se marcan `GRPC` / `PROTOBUF` y no se decodifican. Las **GraphQL persisted queries** salen como `PERSISTED_QUERY`, con `hash`, `version` y `operationName`. Los curl de cuerpo binario usan `--data-binary`.
 
-`flow.sh` usa un solo cookie jar. Cuando hay captcha, descarga la imagen y pide el texto. Ese texto entra en el POST junto con el resto de los campos. Los tokens de un solo uso (ViewState, CSRF, JSESSIONID) caducan: el script marca con `TODO` dónde volver a extraerlos de la respuesta anterior si el servidor los rechaza.
+### Iframes, workers y service workers
 
-Para regenerar `flow.md`, `flow.sh` y el mapa de APIs:
+`wnm-map` se engancha a los targets hijos con CDP `Target.setAutoAttach`. Cada request hija lleva `target_type` (`page`, `iframe`, `worker`, `service_worker`), `target_id`, `target_url` y `frame_id`. `run_meta.json` guarda `auto_attach` y `capabilities`. `--no-auto-attach` vuelve a la sesión de la página principal.
 
-```bash
-$T/wnm-analyze $RUN
-```
+### Auth y tokens
 
-## Mapa de APIs
+`api_map.json` trae `auth_flow` y `api_map.md` la sección **Autenticación / tokens**: qué request emite cada token, quién lo usa y por dónde viaja (cookies, JWT, headers, CSRF, JSF ViewState). `flow.sh` lo encadena con `wnm_json`, `wnm_hidden` y `wnm_urlenc`. Con `--keep-secrets` esa relación se confirma con los valores reales. Sin ese flag, se infiere.
 
-`$RUN/api_map.md` lista cada endpoint con sus marcas (`DATA`, `RECORDS`, `PAGINATED`, `GRAPHQL`), los parámetros, la ruta de los registros y un bloque curl listo para pegar. Arriba incluye un resumen del flujo completo.
+### Rol, paginación y rate limit
 
-```bash
-$T/wnm-analyze $RUN --emit-curl
-```
+Cada endpoint recibe un `role`: `SEARCH`, `LIST` o `DETAIL` (si no encaja, `ACTION` / `OTHER`). `pagination_confirmed` y `confirmed_paginator` se activan cuando dos llamadas al mismo endpoint cambian un solo parámetro. Un `429` junto con `retry-after` o `x-ratelimit-*` genera `rate_limit`, el flag `RATE_LIMIT` y la sección **Rate limit**.
 
-Eso escribe `$RUN/curls.sh`.
+### Anti-bot
 
-## Extraer datos
+`detect_anti_bot()` reconoce Cloudflare, hCaptcha, reCAPTCHA, Akamai, PerimeterX, DataDome, Imperva, desafíos genéricos 403/503 y captcha propio del servidor. El resultado va en `anti_bot` y en **Protección anti-bot detectada**, con una estrategia sugerida en español. Solo detecta y aconseja.
 
-```bash
-$T/wnm-replay $RUN --list
-$T/wnm-replay $RUN/api_map.json 1 --paginate page --max-pages 0 --format both
-```
+### OpenAPI y `--json`
 
-La salida queda en `$RUN/extracts/` (JSON y CSV). `--curl` y `--dry-run` muestran la request exacta sin enviarla.
-
-| Paginación | Flags |
-|---|---|
-| Por número de página | `--paginate page` |
-| Por cursor | `--cursor-param` y `--cursor-path` |
-| Por enlace a la siguiente | `--next-url-path` |
-| Por valores explícitos | `--values a,b,c` |
-| Un parámetro concreto | `--param K=V` |
-
-## Recon pasivo
+Si hay endpoints de primera parte, `wnm-analyze` escribe `openapi.json` (OpenAPI 3.0.3). `--no-openapi` lo omite. `--json` imprime solo el resumen: `openapi_file`, `auth_tokens`, `anti_bot`, `rate_limited_endpoints`, `roles` y las rutas del mapa.
 
 ```bash
-$T/wnm-recon ejemplo.com
+./wnm-analyze "$RUN" --json
 ```
 
-Consulta subdominios en c99 y crt.sh, resuelve A/AAAA, detecta Cloudflare y busca una IP de origen histórica. El reporte queda en `runs/recon-<dominio>-<fecha>/report.md`.
+## Recon
+
+```bash
+./wnm-recon ejemplo.com
+```
+
+Subdominios (crt.sh y c99), DNS, Cloudflare y un veredicto de origen. El reporte queda en `runs/recon-<dominio>-<fecha>/report.md`. La última línea de la salida es esa carpeta. `--json` vuelca `recon.json` en stdout.
+
+| Fuente | Variable | Flag |
+|---|---|---|
+| SecurityTrails | `SECURITYTRAILS_API_KEY` | `--securitytrails-key` |
+| Shodan | `SHODAN_API_KEY` | `--shodan-key` |
+| Censys | `CENSYS_API_ID`, `CENSYS_API_SECRET` | `--censys-id`, `--censys-secret` |
+
+Sin key, la fuente se salta y el reporte dice «no configurado».
+
+También correlaciona el **favicon** (hash `mmh3`, y `http.favicon.hash` si hay key de Shodan) y el hash del cuerpo contra el edge. Resuelve MX, TXT/SPF, `_dmarc` y subdominios que suelen apuntar al hosting real (`mail`, `smtp`, `ftp`, `cpanel`, `webmail`, `direct`, `origin`, `server`).
+
+Un candidato cuenta como origen si coinciden el hash del cuerpo o el título, si no responde `server: cloudflare`, y tras probar también los puertos **8080** y **8443**. `--scan-range` recorre el rango alrededor de un origen ya verificado (`--range-prefix` 24, `--range-max` 256). Es activo y lento: solo en un objetivo autorizado.
+
+El veredicto junta todas las fuentes. La confianza es alta cuando un candidato histórico o de favicon además se verifica. Si la IP solo existe a nivel DNS, el nivel es **POSIBLE**.
 
 ## Archivos de cada corrida
 
 | Archivo | Qué es |
 |---|---|
-| `flow.md` | Flujo completo, paso a paso, con curl y marcas 🧑 de captcha. |
-| `flow.sh` | Ese mismo flujo en una sesión, con pausa para el captcha. |
-| `api_map.md` / `api_map.json` | Endpoints, con curl por endpoint. |
-| `curls.sh` | Todas las requests como curl (con `--emit-curl`). |
-| `pages.json` | Mapa del sitio: páginas, enlaces y APIs por página. |
-| `network.har` | HAR estándar, abrible en DevTools. |
-| `bodies/` | Cuerpos de respuesta guardados. |
-| `requests.jsonl` | Una línea por request capturada. |
+| `flow.md` / `flow.sh` | Flujo completo, con curl, pausa de captcha y encadenado de tokens. |
+| `api_map.md` / `api_map.json` | Endpoints, rol, paginación, auth, anti-bot, rate limit y curl. |
+| `openapi.json` | OpenAPI 3.0.3 de los endpoints de primera parte. |
+| `run_meta.json` | Metadatos, con `auto_attach` y `capabilities`. |
+| `curls.sh` | Requests como curl, con `--emit-curl`. |
+| `pages.json` | Páginas, enlaces y APIs por página. |
+| `network.har` | HAR estándar. |
+| `bodies/` | Cuerpos de respuesta. |
+| `requests.jsonl` | Una línea por request, con el target que la originó. |
 | `extracts/` | JSON y CSV de `wnm-replay`. |
-
-## Curl y secretos
-
-Cada curl lleva método, URL con la query de ejemplo, cabeceras capturadas y cuerpo (`--data-raw`) en POST y GraphQL. `accept-encoding` se traduce a `--compressed`.
-
-Por defecto, cookies, tokens y campos sensibles salen como `${VARIABLES}`, con una nota de qué exportar antes de ejecutar. `--keep-secrets` en la captura guarda los valores reales. `wnm-analyze --curl-secrets` los escribe en el curl si se guardaron. `--curl-redact` fuerza los placeholders.
-
-Los cuerpos de respuesta se guardan tal cual.
 
 ## Captcha
 
-La herramienta detecta el paso del captcha, muestra la imagen y espera a que escribas el texto. Con esa respuesta completa el resto del flujo. Cada consulta nueva necesita una sesión fresca y un captcha nuevo.
-
-## Seguridad
-
-- Los dominios `.gob`, `.gov` y `.mil` (y variantes como `gob.bo` o `gov.co`) se rechazan solos. Con autorización explícita para ese sitio, antepón `WNM_ALLOW_RESTRICTED=1`.
-- Respeta esperas y `robots.txt`. Los límites se suben en sitios propios o autorizados.
-- Los secretos se ocultan en logs, HAR y curl.
-- Los desafíos de captcha, Cloudflare y los muros de pago quedan como pasos humanos.
+La herramienta detecta el paso, muestra la imagen y espera el texto. Con esa respuesta sigue el flujo. Cada consulta nueva necesita una sesión fresca y un captcha nuevo.
 
 ## Límites
 
-- La captura CDP cubre el frame principal.
 - Los enlaces salen de `<a href>`.
 - Los curl usan un user-agent de HeadlessChrome, que algunos sitios rechazan.
 - Tokens, cookies y el texto del captcha caducan.
-- El agrupado de endpoints es heurístico.
-- Varios servicios de IP histórica piden una API de pago.
+- Roles, vínculos de token sin `--keep-secrets`, agrupado de endpoints y detección anti-bot son heurísticos.
+- gRPC y protobuf se identifican y no se decodifican.
+- Sin `--no-auto-attach`, iframes, workers y service workers entran en `requests.jsonl`.
+- Una IP histórica sigue en `POSIBLE` hasta verificarla. Un origen verificado puede cerrarse después.

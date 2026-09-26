@@ -27,8 +27,10 @@ Tool folder: `/home/box/tools/web-network-mapper/` (full flag list in its `READM
    `RUN=$($T/wnm-map <url> [--depth N] [--max-pages N] [--scroll] [--actions FILE] [--include REGEX] [--block image,font] [--emit-curl api] | tail -1)`
    - `--scroll` for infinite scroll/lazy loading, `--actions FILE` for clicks/typing that trigger loads (see `examples/`), `--headed` to watch or let the user fill a form/captcha.
    - Run dir contains `requests.jsonl`, `network.har`, `bodies/`, `pages.json` (site map), `api_map.json`, `api_map.md`, `flow.md`, `flow.sh`, and `curls.sh` when `--emit-curl` is used.
+   - Also `openapi.json` (when first-party endpoints exist) and `run_meta.json` (now with `auto_attach` and `capabilities`). Iframes/workers/service workers are captured by default; `--no-auto-attach` limits capture to the main page session.
 5. **Review the end-to-end flow (`flow.md`):** the ordered chain of every real request from the first page load to the final data response, each with its curl. Steps that need a human (a captcha image to read, a one-time challenge) are marked 🧑. `flow.sh` is a runnable version of that chain in a single cookie jar that **pauses and asks the user to type the captcha** where needed. This is the answer to "how do I automate the whole thing including the query": you get every step, not just the last API, and the tool is honest that captcha steps require a person.
 6. **Review the endpoint map (`api_map.md`):** endpoints flagged DATA / RECORDS / PAGINATED / GRAPHQL are extraction candidates; each shows the records path, keys, pagination params, a ready **curl** block (secrets shown as `${VARS}` to export first) and a replay command. Dump every request as curl with `$T/wnm-analyze $RUN --emit-curl` → `$RUN/curls.sh`.
+   - Also check the `## Autenticación / tokens`, `## Protección anti-bot detectada` and `## Rate limit` sections, and each endpoint's `role` / `confirmed_paginator`. For a machine-readable summary: `$T/wnm-analyze $RUN --json` (JSON only on stdout).
 7. **Extract:** `$T/wnm-replay $RUN --list`, then
    `$T/wnm-replay $RUN/api_map.json <index|key|substring> --paginate <param> --max-pages 0 --format both`
    - Cursor APIs: `--cursor-param` + `--cursor-path`; next-link APIs: `--next-url-path`; explicit values: `--values a,b,c`; override params with `--param K=V`. Use `--dry-run` or `--curl` to preview. Output goes to `$RUN/extracts/`.
@@ -47,11 +49,40 @@ Tool folder: `/home/box/tools/web-network-mapper/` (full flag list in its `READM
 ## Domain recon (passive, for authorized non-gov targets)
 Reusable recon on any allowed domain: pull subdomains from the c99 subdomain finder and crt.sh; resolve A/AAAA with `dig`; flag Cloudflare (CF ranges/CNAME/NS); look for a historical/origin IP from before Cloudflare; for a candidate origin IP, `ping` it and `curl -I --resolve <domain>:443:<ip>` to check it still serves the real site. See `runs/recon-*/report.md`.
 
+## Analyze: new outputs and flags
+- **Body decoding:** gzip/deflate/brotli/zstd bodies decoded automatically (by `content-encoding` or magic bytes). gRPC/protobuf detected → flags `GRPC` / `PROTOBUF` (not decoded). GraphQL persisted queries → flag `PERSISTED_QUERY` with `hash` / `version` / `operationName`. Curls for binary bodies use `--data-binary @<(printf ...)`.
+- **Iframes / workers / service workers:** CDP `Target.setAutoAttach` (`flatten=false`). Child requests tagged `target_type` (`page`/`iframe`/`worker`/`service_worker`), `target_id`, `target_url`, `frame_id`; deduplicated. `run_meta.json` has `auto_attach` and `capabilities`.
+- **Auth / token flow:** `auth_flow` in `api_map.json` and `## Autenticación / tokens` in `api_map.md` — who issues each token, who uses it, and transport (cookies, JSON `access_token`/`id_token`/`jwt`, headers, hidden CSRF / JSF ViewState fields). `flow.sh` has helpers `wnm_json`, `wnm_hidden`, `wnm_urlenc` that extract a token/field from one step and feed it to the next. With `--keep-secrets` the token→calls link is confirmed (otherwise inferred).
+- **Classification:** `role` = `SEARCH` / `LIST` / `DETAIL` (fallback `ACTION` / `OTHER`). `pagination_confirmed` / `confirmed_paginator` when two calls differ in a single parameter. Rate limit from `429` + `retry-after` / `x-ratelimit-*` → `rate_limit`, flag `RATE_LIMIT`, section `## Rate limit`.
+- **Anti-bot:** `detect_anti_bot()` in `wnm_common.py` (shared with recon): Cloudflare, hCaptcha, reCAPTCHA, Akamai, PerimeterX, DataDome, Imperva, generic 403/503 challenge, "Captcha propio (servidor)". Output: `anti_bot` in `api_map.json`, `## Protección anti-bot detectada` in `api_map.md`, with a suggested strategy in Spanish. Detection/advice only — hand challenges to the user.
+- **OpenAPI:** `openapi.json` (OpenAPI 3.0.3, validated with openapi-spec-validator) when first-party endpoints exist.
+
+| Command | Flag | Effect |
+|---|---|---|
+| `wnm-map` | `--no-auto-attach` | Skip iframes/workers/service workers |
+| `wnm-analyze` | `--openapi` (default on) / `--no-openapi` | Write / skip `openapi.json` |
+| `wnm-analyze` | `--json` | Print only the JSON summary (`openapi_file`, `auth_tokens`, `anti_bot`, `rate_limited_endpoints`, `roles`, `api_map_json`, `api_map_md`) |
+
+## Recon: new sources, flags and sections
+- **Historical IPs by API key:** SecurityTrails (`SECURITYTRAILS_API_KEY` / `--securitytrails-key`), Shodan (`SHODAN_API_KEY` / `--shodan-key`), Censys (`CENSYS_API_ID` + `CENSYS_API_SECRET` / `--censys-id` + `--censys-secret`). No key → skipped with note "no configurado". Only use keys the user provides; never ask them to paste keys in chat — use env vars.
+- **Favicon hash:** Shodan-style `mmh3` hash + Shodan `http.favicon.hash` search (needs Shodan key) + body-hash comparison vs edge.
+- **Extra DNS:** MX, TXT/SPF, `_dmarc`, common subdomains (`mail`, `smtp`, `ftp`, `cpanel`, `webmail`, `direct`, `origin`, `server`) → `## Registros DNS de infraestructura (correo, etc.)`.
+- **Robust verification:** match on body hash OR title; rejects `server: cloudflare`; tries ports 8080/8443. Table shows served port/scheme + body-match.
+- **Range scan (opt-in):** `--scan-range`, `--range-prefix` (default 24), `--range-max` (default 256) → `## Escaneo de rango /N alrededor del origen`. Slow and active; only for authorized targets and when the user asks.
+- **Verdict:** all sources feed `bypass_verdict`. High confidence when a historical/favicon candidate is also verified ("Corroborado por: ..."); new medium branch `POSIBLE` when historical/favicon IPs exist only at DNS level. New sections `## Fuentes historicas / pasivas y favicon`, `## Proteccion anti-bot`.
+- `--json` dumps `recon.json` to stdout; the run dir is still the last line (`tail -1`).
+
+## Dependencies
+`brotli>=1.1`, `zstandard>=0.22`, `mmh3>=4.0` (in `requirements.txt`; installed by `setup.sh`).
+
 ## Rules
 - Government (.gob/.gov/.mil) domains are blocked; only proceed with `WNM_ALLOW_RESTRICTED=1` when the user explicitly authorizes that specific target.
 - Be polite: keep default delays, `--max-pages` limits and robots.txt handling unless the user explicitly asks otherwise and it's their site or authorized.
 - Secrets are redacted by default in logs, HAR and curls. Never paste tokens/cookies into chat. Response bodies are not redacted.
 - Do not bypass captchas, Cloudflare challenges or paywalls; the flow output marks those as human steps and hands them to the user.
+- Anti-bot detection is diagnostic: report the vendor and suggested strategy, but don't try to defeat the protection.
+- `--scan-range` is active probing: only on authorized targets and when the user explicitly asks.
 
 ## Known limits
 Main-frame CDP capture only; links come from `<a href>` only; generated curls use a HeadlessChrome UA some sites block; captured tokens/cookies and captcha text expire (each real query needs a fresh session + captcha); endpoint grouping is heuristic; many historical-IP services need paid API keys.
+Update: iframes/workers/service workers are now captured via auto-attach (so "main-frame only" applies only with `--no-auto-attach`); SecurityTrails/Shodan/Censys are queried when keys are supplied; gRPC/protobuf bodies are flagged but not decoded; roles, inferred token links and anti-bot detection are heuristic; a historical IP stays `POSIBLE` until verified.

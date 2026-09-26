@@ -36,6 +36,7 @@ import analyze  # noqa: E402
 from wnm_common import (  # noqa: E402
     REDACTED, is_sensitive_header, is_sensitive_field, load_cookies_file, lower_headers,
     parse_header_args, redact_headers, redact_post_data, redact_url, slugify, guard_target,
+    detect_body_kind,
 )
 
 SKIP_EXT = re.compile(
@@ -98,12 +99,23 @@ class Capture:
         self.ws_out = None
         self.ws_meta: dict[str, dict] = {}
         self.stats = {"requests": 0, "bodies_saved": 0, "body_errors": 0, "ws_frames": 0}
+        # auto-attached child targets (OOP iframes, dedicated/shared workers, service workers)
+        self.children: dict[str, dict] = {}       # sessionId -> {"type", "url", "target_id"}
+        self._child_pending: dict[int, asyncio.Future] = {}
+        self._child_msg_id = 900_000
+        self._main_rids: set[str] = set()          # raw requestIds seen on the main session
+        self._child_ignored: set[str] = set()      # "sid|rid" keys dropped as duplicates of main
+        self._sw_served: set[tuple] = set()        # (method, url) the page got from its service worker
+        self.auto_attach = {"enabled": bool(getattr(args, "auto_attach", True)), "status": "not_started",
+                            "mode": None, "targets_attached": {}, "child_requests": 0,
+                            "duplicates_skipped": 0, "notes": []}
 
     # -------- attach
     async def attach(self, page):
         self.cdp = await page.context.new_cdp_session(page)
+        self.children.clear()
         on = self.cdp.on
-        on("Network.requestWillBeSent", self._on_request)
+        on("Network.requestWillBeSent", self._on_main_request)
         on("Network.requestWillBeSentExtraInfo", self._on_request_extra)
         on("Network.responseReceived", self._on_response)
         on("Network.responseReceivedExtraInfo", self._on_response_extra)
@@ -122,6 +134,170 @@ class Capture:
             await self.cdp.send("Network.enable", {})
         if self.args.disable_cache:
             await self.cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        await self._setup_auto_attach()
+
+    # -------- auto-attach (iframes / workers / service workers)
+    async def _setup_auto_attach(self):
+        """Capture requests from out-of-process iframes, workers and service workers.
+
+        Uses Target.setAutoAttach on the page's CDP session. Playwright's CDPSession object can only
+        address its own session, so flat-mode child sessions (flatten=true) are unreachable through it
+        (their events are dropped and Target.sendMessageToTarget is refused). We therefore probe
+        flatten=true only to record that limitation, and run in the non-flat mode where child
+        sessions are driven via Target.sendMessageToTarget / Target.receivedMessageFromTarget.
+        Any failure falls back to main-session-only capture (previous behaviour) with a note."""
+        aa = self.auto_attach
+        if not aa["enabled"]:
+            aa["status"] = "disabled"
+            return
+        try:
+            self.cdp.on("Target.attachedToTarget", self._on_attached)
+            self.cdp.on("Target.detachedFromTarget", self._on_detached)
+            self.cdp.on("Target.receivedMessageFromTarget", self._on_child_message)
+            await self.cdp.send("Target.setAutoAttach",
+                                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": False})
+            aa["status"] = "ok"
+            aa["mode"] = "non-flat (Target.sendMessageToTarget)"
+            if not any("flatten" in n for n in aa["notes"]):
+                aa["notes"].append("flatten=true no es direccionable con la CDPSession de Playwright; "
+                                   "se usa modo no-flat (sendMessageToTarget) para las sesiones hijas")
+        except Exception as e:
+            aa["status"] = "failed"
+            aa["notes"].append(f"auto-attach no disponible, solo se captura el frame principal: {str(e)[:200]}")
+            log("WARN auto-attach unavailable, main-frame capture only:", str(e).splitlines()[0][:200])
+
+    def _on_attached(self, p):
+        try:
+            sid = p.get("sessionId")
+            ti = p.get("targetInfo") or {}
+            ttype = ti.get("type") or "other"
+            self.children[sid] = {"type": ttype, "url": ti.get("url"), "target_id": ti.get("targetId")}
+            ta = self.auto_attach["targets_attached"]
+            ta[ttype] = ta.get(ttype, 0) + 1
+            self._spawn(self._enable_child(sid, ttype))
+        except Exception as e:
+            log("WARN attachedToTarget handler:", e)
+
+    async def _enable_child(self, sid, ttype):
+        params = {"maxTotalBufferSize": 64 * 1024 * 1024, "maxResourceBufferSize": 16 * 1024 * 1024,
+                  "maxPostDataSize": 1024 * 1024}
+        try:
+            try:
+                await self._child_send(sid, "Network.enable", params)
+            except Exception:
+                await self._child_send(sid, "Network.enable", {})
+            if self.args.disable_cache:
+                await self._child_send(sid, "Network.setCacheDisabled", {"cacheDisabled": True})
+        except Exception as e:
+            note = f"Network.enable falló en {ttype}: {str(e)[:120]}"
+            if note not in self.auto_attach["notes"] and len(self.auto_attach["notes"]) < 20:
+                self.auto_attach["notes"].append(note)
+        # workers are started paused only if waitForDebuggerOnStart; harmless otherwise
+        try:
+            await self._child_send(sid, "Runtime.runIfWaitingForDebugger", {}, timeout=3)
+        except Exception:
+            pass
+
+    def _on_detached(self, p):
+        sid = p.get("sessionId")
+        self.children.pop(sid, None)
+        for fut in list(self._child_pending.values()):
+            if getattr(fut, "_wnm_sid", None) == sid and not fut.done():
+                fut.set_exception(RuntimeError("target detached"))
+
+    async def _child_send(self, sid, method, params=None, timeout=15):
+        self._child_msg_id += 1
+        mid = self._child_msg_id
+        fut = asyncio.get_running_loop().create_future()
+        fut._wnm_sid = sid
+        self._child_pending[mid] = fut
+        try:
+            await self.cdp.send("Target.sendMessageToTarget",
+                                {"sessionId": sid, "message": json.dumps({"id": mid, "method": method,
+                                                                          "params": params or {}})})
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._child_pending.pop(mid, None)
+
+    def _on_child_message(self, p):
+        try:
+            sid = p.get("sessionId")
+            msg = json.loads(p.get("message") or "{}")
+            if "id" in msg:
+                fut = self._child_pending.get(msg["id"])
+                if fut and not fut.done():
+                    if "error" in msg:
+                        fut.set_exception(RuntimeError(str(msg["error"].get("message", msg["error"]))))
+                    else:
+                        fut.set_result(msg.get("result") or {})
+                return
+            method = msg.get("method") or ""
+            if not method.startswith("Network."):
+                return
+            params = dict(msg.get("params") or {})
+            raw_rid = params.get("requestId")
+            if raw_rid is None:
+                return
+            key = f"{sid}|{raw_rid}"
+            if method == "Network.requestWillBeSent" and raw_rid in self._main_rids and not params.get("redirectResponse"):
+                self._child_ignored.add(key)
+                self.auto_attach["duplicates_skipped"] += 1
+                return
+            if key in self._child_ignored:
+                return
+            params["requestId"] = key
+            handler = {
+                "Network.requestWillBeSent": self._on_request,
+                "Network.requestWillBeSentExtraInfo": self._on_request_extra,
+                "Network.responseReceived": self._on_response,
+                "Network.responseReceivedExtraInfo": self._on_response_extra,
+                "Network.loadingFinished": self._on_finished,
+                "Network.loadingFailed": self._on_failed,
+                "Network.webSocketCreated": self._on_ws_created,
+                "Network.webSocketFrameSent": lambda q: self._on_ws_frame(q, "sent"),
+                "Network.webSocketFrameReceived": lambda q: self._on_ws_frame(q, "received"),
+                "Network.webSocketClosed": self._on_ws_closed,
+                "Network.eventSourceMessageReceived": self._on_sse,
+            }.get(method)
+            if handler is None:
+                return
+            handler(params)
+            if method == "Network.requestWillBeSent":
+                rec = self.records.get(key)
+                if rec is not None:
+                    ch = self.children.get(sid) or {}
+                    rec["target_type"] = ch.get("type") or "child"
+                    rec["target_id"] = ch.get("target_id")
+                    rec["target_url"] = ch.get("url")
+                    if not rec.get("frame_id") and ch.get("type") == "iframe":
+                        rec["frame_id"] = ch.get("target_id")
+                    self.auto_attach["child_requests"] += 1
+        except Exception as e:
+            log("WARN child target message:", e)
+
+    def _on_main_request(self, p):
+        try:
+            self._main_rids.add(p.get("requestId"))
+        except Exception:
+            pass
+        self._on_request(p)
+        try:
+            rec = self.records.get(p.get("requestId"))
+            if rec is not None and "target_type" not in rec:
+                rec["target_type"] = "page"
+        except Exception:
+            pass
+
+    async def _send_for(self, rid: str, method: str, params: dict):
+        """Send a Network.* command to the session that owns the request (main or child target)."""
+        if isinstance(rid, str) and "|" in rid and not rid.startswith("|"):
+            sid, raw = rid.split("|", 1)
+            if "#redirect" in raw:
+                raw = raw.split("#", 1)[0]
+            p2 = dict(params)
+            p2["requestId"] = raw
+            return await self._child_send(sid, method, p2)
+        return await self.cdp.send(method, params)
 
     def _spawn(self, coro):
         t = asyncio.get_running_loop().create_task(coro)
@@ -192,6 +368,8 @@ class Capture:
         rec["remote_ip"] = resp.get("remoteIPAddress")
         rec["from_disk_cache"] = resp.get("fromDiskCache", False)
         rec["from_service_worker"] = resp.get("fromServiceWorker", False)
+        if rec["from_service_worker"] and "|" not in str(rid):
+            self._sw_served.add((rec.get("method"), rec.get("url")))
         rec["from_prefetch_cache"] = resp.get("fromPrefetchCache", False)
         t = resp.get("timing")
         if t:
@@ -261,7 +439,7 @@ class Capture:
     async def _fetch_post_data(self, rid, rec):
         rec["_busy"] = True
         try:
-            r = await self.cdp.send("Network.getRequestPostData", {"requestId": rid})
+            r = await self._send_for(rid, "Network.getRequestPostData", {"requestId": rid})
             rec["post_data"] = r.get("postData")
         except Exception as e:
             rec["post_data_error"] = str(e)[:200]
@@ -277,7 +455,7 @@ class Capture:
 
     async def _fetch_body_inner(self, rid, rec):
         try:
-            r = await self.cdp.send("Network.getResponseBody", {"requestId": rid})
+            r = await self._send_for(rid, "Network.getResponseBody", {"requestId": rid})
         except Exception as e:
             rec["body_error"] = str(e).splitlines()[0][:200]
             self.stats["body_errors"] += 1
@@ -290,6 +468,15 @@ class Capture:
             else:
                 raw = body.encode("utf-8")
             rec["body_size"] = len(raw)
+            try:
+                kind = detect_body_kind(rec.get("mime_type") or (rec.get("response_headers") or {}).get("content-type"))
+                if kind:
+                    rec["body_kind"] = kind  # grpc / protobuf: saved as raw binary, not decoded
+                # CDP getResponseBody already returns the decoded (decompressed) payload
+                if (rec.get("response_headers") or {}).get("content-encoding"):
+                    rec["body_decoded"] = True
+            except Exception:
+                pass
             cap = self.args.max_body_bytes
             if cap > 0 and len(raw) > cap:
                 raw = raw[:cap]
@@ -378,6 +565,10 @@ class Capture:
                 continue
             if final and rec["state"] == "pending":
                 rec["state"] = "incomplete"
+            if self._is_child_duplicate(key, rec):
+                self.written.add(key)
+                self.auto_attach["duplicates_skipped"] += 1
+                continue
             self.req_out.write(json.dumps(self._clean(rec), ensure_ascii=False) + "\n")
             self.written.add(key)
             n += 1
@@ -387,6 +578,22 @@ class Capture:
             if key in self.records and self.records[key]["state"] != "pending":
                 self.records.pop(key, None)
         return n
+
+    def _is_child_duplicate(self, key, rec) -> bool:
+        """A child-target record that is the same request the main session already reported."""
+        try:
+            if "|" not in str(key):
+                return False
+            raw = str(key).split("|", 1)[1].split("#", 1)[0]
+            if raw in self._main_rids:
+                return True
+            if rec.get("target_type") == "service_worker" and (rec.get("method"), rec.get("url")) in self._sw_served:
+                # the page-side request (from_service_worker=true) is already recorded; keep the SW's
+                # own network fetch out of requests.jsonl to avoid double counting
+                return True
+        except Exception:
+            pass
+        return False
 
     def close(self):
         self.req_out.close()
@@ -408,6 +615,25 @@ def _ext_for(mime: str | None, path: str) -> str:
                 return ""  # path slug already ends with the extension
             return ext
     return "" if path_ext else ".bin"
+
+
+def capabilities_info(cap=None) -> dict:
+    """Describe optional capabilities of this build (recorded in run_meta.json)."""
+    def has(mod):
+        try:
+            __import__(mod)
+            return True
+        except Exception:
+            return False
+    aa = (cap.auto_attach if cap is not None else {}) or {}
+    return {
+        "auto_attach_child_targets": aa.get("status") == "ok",
+        "auto_attach_mode": aa.get("mode"),
+        "body_decoding": ["gzip", "deflate"] + (["br"] if has("brotli") else []) + (["zstd"] if has("zstandard") else []),
+        "body_kind_detection": ["json", "grpc", "protobuf"],
+        "analysis": ["graphql_persisted_queries", "auth_flow", "endpoint_roles", "pagination_confirmation",
+                     "rate_limit", "anti_bot", "openapi_export"],
+    }
 
 
 # ============================================================ robots
@@ -803,6 +1029,11 @@ async def crawl(args):
     meta.update({"finished_at": now_iso(), "elapsed_s": round(time.monotonic() - t_start, 1),
                  "pages_visited": visited, "queue_remaining": len(queue), "stats": cap.stats,
                  "redacted": not args.keep_secrets})
+    try:
+        meta["auto_attach"] = cap.auto_attach
+        meta["capabilities"] = capabilities_info(cap)
+    except Exception as e:
+        meta["capabilities_error"] = str(e)[:200]
     (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     log("building api map...")
     summary = analyze.build(run_dir, include_documents=args.map_documents, emit_curl=args.emit_curl,
@@ -856,6 +1087,8 @@ def build_parser():
     g.add_argument("--ignore-https-errors", action="store_true")
     g.add_argument("--disable-cache", action="store_true", help="disable browser cache (Network.setCacheDisabled)")
     g.add_argument("--browser-channel", help="use installed browser channel, e.g. chrome (default: bundled chromium)")
+    g.add_argument("--no-auto-attach", dest="auto_attach", action="store_false", default=True,
+                   help="do not auto-attach to iframes/workers/service workers (capture main page session only)")
     g = ap.add_argument_group("capture / output")
     g.add_argument("--out-root", default=str(TOOL_DIR / "runs"), help="parent dir for run folders")
     g.add_argument("--out", help="exact output dir (overrides --out-root naming)")

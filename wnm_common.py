@@ -232,6 +232,301 @@ def loads_lenient(text: str):
         raise
 
 
+# ------------------------------------------------------------------ body decoding + type detection
+
+# Compressed-stream magic bytes.
+_GZIP_MAGIC = b"\x1f\x8b"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _maybe_import(name):
+    try:
+        return __import__(name)
+    except Exception:
+        return None
+
+
+def _looks_like_text(b: bytes) -> bool:
+    head = b[:512]
+    if not head:
+        return True
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError:
+        try:  # a multibyte char may be cut at the 512-byte boundary
+            head[:-3].decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    ctrl = sum(1 for c in head if c < 9 or 13 < c < 32)
+    return ctrl <= len(head) * 0.02
+
+
+def decode_body_bytes(raw: bytes, content_encoding: str | None = None) -> bytes:
+    """Transparently decompress a response body (gzip / deflate / brotli / zstd).
+
+    Uses the Content-Encoding header when present, and also sniffs magic bytes so a body saved
+    raw (compressed on disk) is still decoded. Best-effort: returns the original bytes on any
+    failure so callers never crash. brotli needs the `brotli` package, zstd needs `zstandard`
+    (both listed in requirements.txt)."""
+    if not raw:
+        return raw
+    enc = (content_encoding or "").lower()
+    encs = [e.strip() for e in enc.split(",") if e.strip()]
+
+    def _try_gzip(b):
+        import gzip
+        return gzip.decompress(b)
+
+    def _try_deflate(b):
+        import zlib
+        try:
+            return zlib.decompress(b)
+        except Exception:
+            return zlib.decompress(b, -zlib.MAX_WBITS)
+
+    def _try_brotli(b):
+        brotli = _maybe_import("brotli")
+        if brotli is None:
+            raise RuntimeError("brotli not installed")
+        return brotli.decompress(b)
+
+    def _try_zstd(b):
+        zstd = _maybe_import("zstandard")
+        if zstd is None:
+            raise RuntimeError("zstandard not installed")
+        return zstd.ZstdDecompressor().decompress(b)
+
+    # 1) honour explicit Content-Encoding (apply in reverse order for chained encodings), unless the
+    #    bytes already look like decoded text (CDP's getResponseBody normally returns decoded data)
+    if _looks_like_text(raw):
+        encs = []
+    for e in reversed(encs):
+        try:
+            if e in ("gzip", "x-gzip"):
+                raw = _try_gzip(raw)
+            elif e == "deflate":
+                raw = _try_deflate(raw)
+            elif e == "br":
+                raw = _try_brotli(raw)
+            elif e == "zstd":
+                raw = _try_zstd(raw)
+        except Exception:
+            pass  # leave as-is; sniffing below may still help
+    # 2) sniff magic bytes (covers bodies stored raw without a decoded header)
+    for _ in range(3):  # unwrap up to a few nested layers
+        try:
+            if raw[:2] == _GZIP_MAGIC:
+                raw = _try_gzip(raw)
+                continue
+            if raw[:4] == _ZSTD_MAGIC:
+                raw = _try_zstd(raw)
+                continue
+        except Exception:
+            pass
+        break
+    return raw
+
+
+# gRPC / protobuf content-type detection.
+_GRPC_CT_RE = re.compile(r"application/grpc(-web)?(\+proto|\+json)?", re.I)
+_PROTOBUF_CT_RE = re.compile(r"application/(x-)?protobuf|application/vnd\..*\+?protobuf|application/octet-stream\+proto", re.I)
+
+
+def detect_body_kind(content_type: str | None, raw: bytes | None = None) -> str | None:
+    """Classify a body beyond JSON. Returns one of 'grpc', 'protobuf', or None.
+
+    Detection is by content-type first (application/grpc*, grpc-web, application/x-protobuf),
+    which is authoritative; we do not attempt to actually decode the binary payload."""
+    ct = (content_type or "").lower()
+    if _GRPC_CT_RE.search(ct) or "grpc-web" in ct:
+        return "grpc"
+    if _PROTOBUF_CT_RE.search(ct):
+        return "protobuf"
+    return None
+
+
+# ------------------------------------------------------------------ anti-bot / challenge fingerprinting
+
+def _cookie_names(cookies) -> list[str]:
+    """Accept a list of cookie dicts, a list of names, or a raw Cookie/Set-Cookie header string."""
+    names = []
+    if not cookies:
+        return names
+    if isinstance(cookies, str):
+        for part in re.split(r"[;\n]", cookies):
+            part = part.strip()
+            if not part:
+                continue
+            nm = part.split("=", 1)[0].strip()
+            if nm:
+                names.append(nm)
+        return names
+    for c in cookies:
+        if isinstance(c, dict):
+            nm = c.get("name") or c.get("Name")
+            if nm:
+                names.append(str(nm))
+        elif isinstance(c, str):
+            names.append(c.split("=", 1)[0].strip())
+    return names
+
+
+# Each rule: vendor, human strategy, and detectors over (headers, body, cookie names).
+_ANTI_BOT_RULES = [
+    {
+        "vendor": "Cloudflare",
+        "url_substr": ["challenges.cloudflare.com", "/cdn-cgi/challenge-platform"],
+        "header_substr": [("server", "cloudflare"), ("cf-ray", ""), ("cf-mitigated", ""), ("cf-chl-bypass", "")],
+        "cookies": ["__cf_bm", "cf_clearance", "__cfwaituntil", "__cfruid"],
+        "body_substr": ["challenges.cloudflare.com/turnstile", "cf-turnstile", "/cdn-cgi/challenge-platform", "cf_chl_opt", "window._cf_chl"],
+        "strategy": "Cloudflare (Turnstile / JS challenge). Usar navegador headed con UA real, resolver el desafío como humano y reutilizar la cookie cf_clearance/__cf_bm en la misma sesión (mismo IP y UA).",
+    },
+    {
+        "vendor": "hCaptcha",
+        "url_substr": ["hcaptcha.com"],
+        "header_substr": [],
+        "cookies": [],
+        "body_substr": ["hcaptcha.com/1/api.js", "js.hcaptcha.com", "h-captcha", "data-hcaptcha-sitekey"],
+        "strategy": "hCaptcha. Requiere que un humano resuelva el captcha en modo headed; capturar el token h-captcha-response y enviarlo antes de que caduque.",
+    },
+    {
+        "vendor": "reCAPTCHA",
+        "url_substr": ["google.com/recaptcha", "gstatic.com/recaptcha", "recaptcha.net"],
+        "header_substr": [],
+        "cookies": [],
+        "body_substr": ["google.com/recaptcha", "gstatic.com/recaptcha", "www.recaptcha.net", "g-recaptcha", "grecaptcha.execute"],
+        "strategy": "Google reCAPTCHA. Resolver con un humano en modo headed (v2) o vigilar el score (v3); pasar el g-recaptcha-response en el envío.",
+    },
+    {
+        "vendor": "Akamai Bot Manager",
+        "url_substr": ["akamaihd.net/", "/akam/"],
+        "header_substr": [("server", "akamaighost"), ("x-akamai", "")],
+        "cookies": ["_abck", "ak_bmsc", "bm_sz", "bm_sv", "bm_mi"],
+        "body_substr": ["akamaihd.net", "/akam/", "bazadebezolkohpepadr"],
+        "strategy": "Akamai Bot Manager. Genera sensor data desde JS; usar navegador real (headed) con la misma sesión y UA; difícil de automatizar sin ejecutar su script de sensor.",
+    },
+    {
+        "vendor": "PerimeterX / HUMAN",
+        "url_substr": ["px-cdn.net", "perimeterx.net", "px-cloud.net"],
+        "header_substr": [("x-px", "")],
+        "cookies": ["_px", "_px2", "_px3", "_pxhd", "_pxvid", "pxcts"],
+        "body_substr": ["px-cdn", "perimeterx.net", "client.perimeterx.net", "captcha.px-cdn", "_pxAppId"],
+        "strategy": "PerimeterX/HUMAN. Ejecuta JS de fingerprinting; usar navegador headed real, resolver el PX captcha si aparece y conservar las cookies _px* en la sesión.",
+    },
+    {
+        "vendor": "DataDome",
+        "url_substr": ["datadome.co", "captcha-delivery.com"],
+        "header_substr": [("x-datadome", ""), ("x-dd-b", "")],
+        "cookies": ["datadome"],
+        "body_substr": ["datadome", "js.datadome.co", "geo.captcha-delivery.com", "captcha-delivery.com"],
+        "strategy": "DataDome. Puede mostrar captcha de captcha-delivery.com; usar navegador headed real, resolver el captcha y mantener la cookie datadome con el mismo UA/IP.",
+    },
+    {
+        "vendor": "Imperva / Incapsula",
+        "url_substr": ["_incapsula_resource"],
+        "header_substr": [("x-iinfo", ""), ("x-cdn", "incapsula")],
+        "cookies": ["incap_ses", "visid_incap", "nlbi_"],
+        "body_substr": ["_Incapsula_Resource", "incapsula.com", "/_Incapsula_"],
+        "strategy": "Imperva/Incapsula. Reto JS/cookie; usar navegador real headed y conservar las cookies incap_ses/visid_incap en la sesión.",
+    },
+]
+
+
+def detect_anti_bot(headers=None, body=None, cookies=None, status: int | None = None,
+                    url: str | None = None) -> list[dict]:
+    """Detect anti-bot / challenge technology from a page's headers, body and cookies.
+
+    Shared by analyze.py (over captured requests) and recon.py (over a freshly fetched page).
+    Returns a list of {vendor, evidence: [..], active, strategy}. `active` is True when a real
+    challenge was seen (challenge script/body, challenge cookie or a 403/429/503), False when only
+    passive signals were seen (e.g. Cloudflare as a plain CDN). Never raises: bad input yields [].
+    `status` (optional) is the HTTP status code of the response; `url` (optional) is the request URL
+    (a request to e.g. challenges.cloudflare.com or hcaptcha.com is itself evidence).
+    `headers` may be a dict (case-insensitive keys are handled). `cookies` may be cookie dicts,
+    names, or a raw Cookie/Set-Cookie header string. `body` is the (decoded) response text."""
+    try:
+        hdrs = {}
+        for k, v in (headers or {}).items():
+            hdrs[str(k).lower()] = "" if v is None else str(v)
+        body_l = (body or "")
+        if not isinstance(body_l, str):
+            try:
+                body_l = body_l.decode("utf-8", "replace")
+            except Exception:
+                body_l = str(body_l)
+        body_l = body_l.lower()
+        # cookies may be explicit, or read from headers (set-cookie / cookie)
+        cnames = _cookie_names(cookies)
+        for hk in ("set-cookie", "cookie"):
+            if hk in hdrs:
+                cnames += _cookie_names(hdrs[hk])
+        cnames_l = [c.lower() for c in cnames]
+        url_l = (url or "").lower()
+        try:
+            status = int(status or hdrs.get(":status") or 0) or None
+        except Exception:
+            status = None
+
+        out = []
+        for rule in _ANTI_BOT_RULES:
+            evidence = []
+            for hname, hval in rule["header_substr"]:
+                if hname in hdrs and (hval == "" or hval in hdrs[hname].lower()):
+                    hv_clean = " / ".join(x.strip() for x in hdrs[hname].splitlines() if x.strip())
+                    ev = f"header {hname}" + (f": {hv_clean[:60]}" if hv_clean else "")
+                    evidence.append(ev)
+            for ck in rule["cookies"]:
+                if any(cn == ck.lower() or cn.startswith(ck.lower()) for cn in cnames_l):
+                    evidence.append(f"cookie {ck}")
+            for bs in rule["body_substr"]:
+                if bs.lower() in body_l:
+                    evidence.append(f"body:{bs}")
+            for us in rule.get("url_substr", []):
+                if url_l and us in url_l:
+                    evidence.append(f"url:{us}")
+            if evidence:
+                active = any(e.startswith(("body:", "cookie ", "url:")) for e in evidence) or status in (403, 429, 503) \
+                    or "cf-mitigated" in hdrs
+                if rule["vendor"] == "Cloudflare" and all(e.startswith("cookie __cfruid") or e.startswith("header")
+                                                          for e in evidence) and status not in (403, 429, 503) \
+                        and "cf-mitigated" not in hdrs:
+                    active = False
+                strategy = rule["strategy"] if active else (
+                    f"{rule['vendor']} presente (señales pasivas, sin desafío observado). Normalmente basta con "
+                    "UA real y ritmo moderado; si aparece un 403/503 o un captcha, pasar a navegador headed + humano.")
+                out.append({"vendor": rule["vendor"], "evidence": sorted(set(evidence))[:8],
+                            "active": bool(active), "strategy": strategy})
+
+        # self-hosted captcha (image/JSF/PHP captcha served by the site itself, no third-party vendor)
+        if not any(o["vendor"] in ("hCaptcha", "reCAPTCHA", "Cloudflare") for o in out):
+            ev = []
+            path_l = url_l.split("?", 1)[0]
+            if re.search(r"captcha[^/]*\.(png|jpe?g|gif|bmp|webp|svg)$|/captcha(image|img)?(\.(php|aspx?|jsp|jsf|do))?$|"
+                         r"/(jcaptcha|simplecaptcha|kaptcha|securimage)", path_l):
+                ev.append(f"url:{path_l.rsplit('/', 1)[-1][:60]}")
+            if re.search(r"javax\.faces\.resource/captcha/", url_l):
+                ev.append("url:PrimeFaces captcha.js")
+            if re.search(r"<img[^>]+(src|id|alt)=[\"'][^\"']*captcha", body_l):
+                ev.append("body:<img captcha>")
+            if re.search(r"<input[^>]+name=[\"'][^\"']*(captcha|codigo_?seguridad)[^\"']*[\"']", body_l):
+                ev.append("body:campo de captcha en formulario")
+            if ev:
+                out.append({"vendor": "Captcha propio (servidor)", "evidence": ev, "active": True,
+                            "strategy": "Captcha de imagen servido por el propio sitio. Un humano debe verlo y teclear el "
+                                        "texto (flow.sh pausa en ese paso); mantener la misma sesión/cookie en la que se "
+                                        "descargó la imagen. No se evade ni se resuelve automáticamente."})
+
+        # generic JS challenge: 403/503 with a small HTML body that isn't a known vendor
+        if status in (403, 429, 503) and not out and ("<html" in body_l or not body_l):
+            hint = "Posible desafío JS genérico (403/503 con HTML de reto). Reintentar en navegador headed real con UA/idioma normales y sesión persistente."
+            if re.search(r"challenge|captcha|verify you are|checking your browser|just a moment|access denied|robot", body_l):
+                out.append({"vendor": "Desafío JS genérico", "evidence": [f"status {status}", "body: HTML de reto"],
+                            "active": True, "strategy": hint})
+        return out
+    except Exception:
+        return []
+
+
 # ------------------------------------------------------------------ safety: restricted domains
 import os as _os
 from urllib.parse import urlsplit as _urlsplit
