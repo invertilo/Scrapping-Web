@@ -39,8 +39,25 @@ Abre el sitio en un Chromium controlado por Playwright y registra cada request y
 
 Después puede volver a llamar esas APIs con paginación y exportar los datos a JSON o CSV. También hace reconocimiento pasivo de un dominio: subdominios, detección de Cloudflare y posibles IPs de origen.
 
+## La skill
+
+`SKILL.md` es la guía que usa un agente para correr esta herramienta de principio a fin. Le dice cuándo mapear, cómo leer el flujo, cómo sacar el curl de cada paso y cómo repetir un endpoint con paginación. El agente sigue ese orden en un sitio que ya estás autorizado a probar, y te deja el mapa, el flujo y los datos exportados.
+
+Está pensada para seguridad ofensiva: en un pentest, el valor está en los endpoints que la aplicación llama de verdad (XHR, fetch, GraphQL), en el orden en que se llaman y en poder repetirlos. La skill convierte esa captura en un recorrido reproducible: cada paso tiene su curl, los endpoints quedan agrupados y los que paginan se pueden recorrer solos hasta exportar JSON o CSV.
+
+El uso es en páginas y APIs para las que tienes permiso. Un pentest, una auditoría o un sitio propio. Los dominios `.gob`, `.gov` y `.mil` se rechazan si no hay una autorización explícita para ese objetivo.
+
+| Con la skill | Sin la skill |
+|---|---|
+| El agente captura el tráfico real y arma el mapa de endpoints solo. | Hay que abrir DevTools, copiar cada request y ordenarlas a mano. |
+| Entrega el flujo completo, del primer load a la respuesta con datos, con un curl por paso. | Queda la última llamada visible y se pierde el camino que llegó hasta ahí. |
+| Marca captcha y desafíos para que los resuelva una persona, y sigue con el resto. | Esos pasos se mezclan con las APIs y el recorrido se corta. |
+| Repite el endpoint página por página y deja JSON y CSV. | La paginación y la exportación se escriben de cero en cada prueba. |
+| Oculta cookies y tokens en los curl y parte de un alcance acotado. | Es fácil pegar secretos en notas o probar fuera del sitio autorizado. |
+
 ## Contenido
 
+- [La skill](#la-skill)
 - [Piezas](#piezas)
 - [Instalación](#instalación)
 - [Capturar y mapear](#capturar-y-mapear)
